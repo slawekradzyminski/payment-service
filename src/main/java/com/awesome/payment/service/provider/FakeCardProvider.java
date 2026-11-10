@@ -26,6 +26,7 @@ public class FakeCardProvider {
     public static final String INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS";
     public static final String THREE_DS_FAILED = "THREE_DS_FAILED";
     public static final String PROVIDER_TIMEOUT = "PROVIDER_TIMEOUT";
+    public static final String THREE_DS_EXPIRED = "THREE_DS_EXPIRED";
 
     static final String INVALID_NUMBER = "Card number is invalid";
     static final String EXPIRED = "Card has expired";
@@ -76,6 +77,7 @@ public class FakeCardProvider {
             case INSUFFICIENT_FUNDS -> "Your card has insufficient funds";
             case THREE_DS_FAILED -> "3-D Secure authentication failed";
             case PROVIDER_TIMEOUT -> "The payment provider did not respond in time";
+            case THREE_DS_EXPIRED -> "3-D Secure was not completed in time";
             default -> "The payment failed";
         };
     }

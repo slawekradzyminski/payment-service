@@ -51,7 +51,8 @@ and a `MutableClock` that drives settlement delays, outbox backoff and card expi
 
 - PITest: run the profile above after normal verification when you change the
   card checks or provider, the payment state machine, the signature, the result
-  outbox or dispatcher, settlement, refunds or the service-token filter. Narrow it
+  outbox or dispatcher, settlement and 3-D Secure expiry, refunds, the per-order
+  payment lock or the service-token filter. Narrow it
   for small changes, for example
   `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage -DtargetClasses=com.awesome.payment.service.PaymentStateMachine -DtargetTests=com.awesome.payment.service.PaymentStateMachineTest`.
 - Treat `NO_COVERAGE` as a reachability gap and `SURVIVED` as an assertion gap.

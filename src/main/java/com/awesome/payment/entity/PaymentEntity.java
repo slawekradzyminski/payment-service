@@ -66,6 +66,10 @@ public class PaymentEntity {
     @Column(length = 16)
     private Settlement settlement;
 
+    /**
+     * Deadline: when a PROCESSING payment settles, or when a REQUIRES_ACTION payment expires
+     * because the 3-D Secure challenge was not answered.
+     */
     @Column(name = "settle_at")
     private LocalDateTime settleAt;
 

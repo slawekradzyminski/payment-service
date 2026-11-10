@@ -39,7 +39,7 @@ class NativeEntityMappingTest {
             }
         }
 
-        assertThat(entities).isEqualTo(4);
+        assertThat(entities).isEqualTo(5);
         assertThat(lazy).as("lazy to-one associations break the native image").isEmpty();
     }
 }

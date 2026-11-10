@@ -333,6 +333,7 @@
                                 <param>com.awesome.payment.service.PaymentService</param>
                                 <param>com.awesome.payment.service.SettlementJob</param>
                                 <param>com.awesome.payment.service.RefundService</param>
+                                <param>com.awesome.payment.service.OrderPaymentLocks</param>
                                 <param>com.awesome.payment.service.notification.PaymentSignature</param>
                                 <param>com.awesome.payment.service.notification.PaymentResultOutbox</param>
                                 <param>com.awesome.payment.service.notification.PaymentResultDispatcher</param>

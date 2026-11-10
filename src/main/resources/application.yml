@@ -54,6 +54,8 @@ payment:
   webhook-secret: ${PAYMENT_WEBHOOK_SECRET:local-payment-webhook-secret}
   # Simulated provider: PROCESSING test cards settle (or time out) after this delay.
   settlement-delay: ${PAYMENT_SETTLEMENT_DELAY:PT10S}
+  # Unanswered 3-D Secure challenges fail with THREE_DS_EXPIRED after this long.
+  three-ds-timeout: ${PAYMENT_THREE_DS_TIMEOUT:PT15M}
   settlement:
     enabled: ${PAYMENT_SETTLEMENT_ENABLED:true}
     interval: ${PAYMENT_SETTLEMENT_INTERVAL:PT2S}

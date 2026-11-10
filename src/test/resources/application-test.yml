@@ -9,6 +9,7 @@ payment:
   service-token: test-service-token
   webhook-secret: test-webhook-secret
   settlement-delay: PT10S
+  three-ds-timeout: PT15M
   # Scheduled jobs are driven explicitly by the tests.
   settlement:
     enabled: false

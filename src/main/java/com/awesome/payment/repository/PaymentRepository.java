@@ -22,12 +22,21 @@ public interface PaymentRepository extends JpaRepository<PaymentEntity, UUID> {
     /** The order's card payment that refunds go to (at most one exists; newest first just in case). */
     List<PaymentEntity> findByOrderIdAndStatusInOrderByCreatedAtDesc(Long orderId, Collection<PaymentStatus> statuses);
 
+    /** The order's payments in {@code status} whose deadline has passed. */
+    List<PaymentEntity> findByOrderIdAndStatusAndSettleAtLessThanEqual(Long orderId, PaymentStatus status,
+                                                                     LocalDateTime now);
+
     Page<PaymentEntity> findByStatus(PaymentStatus status, Pageable pageable);
 
-    /** PROCESSING payments whose simulated settlement is due, oldest first. */
+    /**
+     * Payments whose deadline has passed, oldest first: PROCESSING ones settle, REQUIRES_ACTION
+     * ones expire (3-D Secure not completed in time).
+     */
     @Query("""
             select p from PaymentEntity p
-            where p.status = com.awesome.payment.entity.PaymentStatus.PROCESSING and p.settleAt <= :now
+            where p.status in (com.awesome.payment.entity.PaymentStatus.PROCESSING,
+                               com.awesome.payment.entity.PaymentStatus.REQUIRES_ACTION)
+              and p.settleAt <= :now
             order by p.settleAt""")
     List<PaymentEntity> findDueForSettlement(@Param("now") LocalDateTime now, Pageable pageable);
 }

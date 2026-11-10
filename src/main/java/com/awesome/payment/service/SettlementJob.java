@@ -1,6 +1,7 @@
 package com.awesome.payment.service;
 
 import com.awesome.payment.entity.PaymentEntity;
+import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.entity.Settlement;
 import com.awesome.payment.repository.PaymentRepository;
 import com.awesome.payment.service.notification.PaymentResultOutbox;
@@ -21,8 +22,9 @@ import java.util.UUID;
 
 /**
  * The simulated provider's asynchronous side: PROCESSING payments whose
- * {@code payment.settlement-delay} has passed are captured, or fail with PROVIDER_TIMEOUT,
- * and their result is queued for the backend. Disabled with {@code payment.settlement.enabled}.
+ * {@code payment.settlement-delay} has passed are captured, or fail with PROVIDER_TIMEOUT;
+ * REQUIRES_ACTION payments older than {@code payment.three-ds-timeout} fail with
+ * THREE_DS_EXPIRED. Each result is queued for the backend. Disabled with {@code payment.settlement.enabled}.
  */
 @Slf4j
 @Component
@@ -79,7 +81,10 @@ public class SettlementJob {
         if (payment == null || payment.getSettleAt() == null || payment.getSettleAt().isAfter(now)) {
             return false;
         }
-        if (payment.getSettlement() == Settlement.TIMEOUT) {
+        if (payment.getStatus() == PaymentStatus.REQUIRES_ACTION) {
+            PaymentStateMachine.fail(payment, FakeCardProvider.THREE_DS_EXPIRED,
+                    FakeCardProvider.failureMessage(FakeCardProvider.THREE_DS_EXPIRED), now);
+        } else if (payment.getSettlement() == Settlement.TIMEOUT) {
             PaymentStateMachine.fail(payment, FakeCardProvider.PROVIDER_TIMEOUT,
                     FakeCardProvider.failureMessage(FakeCardProvider.PROVIDER_TIMEOUT), now);
         } else {

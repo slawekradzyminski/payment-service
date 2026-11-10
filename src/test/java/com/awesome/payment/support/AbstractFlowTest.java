@@ -61,6 +61,7 @@ public abstract class AbstractFlowTest {
     @Autowired protected PaymentOutboxRepository outboxRepository;
     @Autowired private IdempotencyKeyRepository idempotencyKeyRepository;
     @Autowired private RefundRepository refundRepository;
+    @Autowired private com.awesome.payment.repository.OrderPaymentLockRepository orderPaymentLocks;
 
     @BeforeEach
     void resetBackend() {
@@ -74,6 +75,7 @@ public abstract class AbstractFlowTest {
         outboxRepository.deleteAll();
         idempotencyKeyRepository.deleteAll();
         paymentRepository.deleteAll();
+        orderPaymentLocks.deleteAll();
     }
 
     protected static String newKey() {

@@ -30,7 +30,17 @@ The amount is the order's `amountDue` (or `totalAmount` when the backend does no
 
 An order is payable when the backend reports it `PENDING` and it has no local payment in
 `REQUIRES_ACTION`, `PROCESSING`, `CAPTURED`, `PARTIALLY_REFUNDED` or `REFUNDED`.
-Failed and voided payments do not block a new attempt.
+Failed and voided payments do not block a new attempt. A 3-D Secure challenge that
+is not answered within `payment.three-ds-timeout` (default 15 min) fails with
+`THREE_DS_EXPIRED`: the settlement job expires it, and so does a new payment attempt
+for the same order or a late answer (which then gets 409), so the customer can retry
+at once. The FAILED result is sent to the backend like any other failure.
+
+Payment creation for one order is serialised with a row lock (`order_payment_locks`,
+`SELECT ... FOR UPDATE`, Flyway `V2`), so two concurrent submissions can never both
+become the active payment, and a double submit with the same `Idempotency-Key` is
+answered as a replay. (A partial unique index was not used: H2, the test database,
+does not support `WHERE` on indexes.)
 
 ### Test cards
 
@@ -42,7 +52,7 @@ Spaces and dashes are ignored. Expiry must not be before the current month.
 | 5555 5555 5555 4444 | CAPTURED (MASTERCARD) |
 | 4000 0000 0000 0002 | FAILED `CARD_DECLINED` |
 | 4000 0000 0000 9995 | FAILED `INSUFFICIENT_FUNDS` |
-| 4000 0000 0000 3220 | REQUIRES_ACTION (3-D Secure code 123456) |
+| 4000 0000 0000 3220 | REQUIRES_ACTION (3-D Secure code 123456; expires after `payment.three-ds-timeout`) |
 | 4000 0000 0000 0077 | PROCESSING, CAPTURED after `payment.settlement-delay` |
 | 4000 0000 0000 0119 | PROCESSING, FAILED `PROVIDER_TIMEOUT` after the same delay |
 | 4000 0000 0000 0259 | CAPTURED; the result is delivered to the backend twice with the same requestId |
@@ -94,8 +104,8 @@ where `status` is the payment status after the refund (`PARTIALLY_REFUNDED` or
 404 when the order has no captured payment, 409 when the amount exceeds what is
 still refundable.
 
-Local tables (Flyway `V1`, schema `payment`): `payments`, `payment_idempotency_keys`,
-`payment_outbox`, `refunds`.
+Local tables (Flyway `V1`–`V2`, schema `payment`): `payments`, `payment_idempotency_keys`,
+`payment_outbox`, `refunds`, `order_payment_locks`.
 
 ## Run
 
@@ -125,6 +135,7 @@ Profiles:
 | `PAYMENT_SERVICE_TOKEN` | `payment.service-token` | `local-payment-token`; no default in `docker`; blank disables the refund API and sends backend calls without a token |
 | `PAYMENT_WEBHOOK_SECRET` | `payment.webhook-secret` | `local-payment-webhook-secret`; no default in `docker`; must not be blank |
 | `PAYMENT_SETTLEMENT_DELAY` | `payment.settlement-delay` | `PT10S` |
+| `PAYMENT_THREE_DS_TIMEOUT` | `payment.three-ds-timeout` | `PT15M` (unanswered challenges fail with `THREE_DS_EXPIRED`) |
 | `PAYMENT_SETTLEMENT_ENABLED` / `_INTERVAL` | `payment.settlement.*` | `true` / `PT2S` |
 | `PAYMENT_NOTIFICATIONS_RETRY_ENABLED` / `_RETRY_INTERVAL` | `payment.notifications.*` | `true` / `PT30S` |
 | `JWT_JWKS_REFRESH_INTERVAL` | `security.jwt.jwks-refresh-interval` | `10s` |
@@ -164,5 +175,5 @@ tag-triggered `publish-image.yml`. `Dockerfile.jvm` builds a JVM fallback image.
 
 - PITest: `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage`
   (scope: `CardChecks`, `FakeCardProvider`, `PaymentStateMachine`, `PaymentService`,
-  `SettlementJob`, `RefundService`, `PaymentSignature`, `PaymentResultOutbox`,
+  `SettlementJob`, `RefundService`, `OrderPaymentLocks`, `PaymentSignature`, `PaymentResultOutbox`,
   `PaymentResultDispatcher`, `ServiceTokenFilter`). Advisory, not a gate.

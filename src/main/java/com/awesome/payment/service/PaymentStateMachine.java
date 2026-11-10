@@ -54,6 +54,12 @@ public final class PaymentStateMachine {
         finishPending(payment, now);
     }
 
+    /** A REQUIRES_ACTION payment whose 3-D Secure deadline has passed. */
+    public static boolean isThreeDsExpired(PaymentEntity payment, LocalDateTime now) {
+        return payment.getStatus() == PaymentStatus.REQUIRES_ACTION && payment.getSettleAt() != null
+                && !payment.getSettleAt().isAfter(now);
+    }
+
     /**
      * The backend refused a capture because the order is no longer payable: the money goes back
      * to the card, so the whole amount counts as returned.

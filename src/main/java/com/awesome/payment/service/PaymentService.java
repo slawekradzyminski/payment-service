@@ -60,11 +60,14 @@ public class PaymentService {
     private final PaymentSignature signature;
     private final Clock paymentClock;
     private final Duration settlementDelay;
+    private final Duration threeDsTimeout;
+    private final OrderPaymentLocks orderLocks;
 
     public PaymentService(PaymentRepository paymentRepository, IdempotencyKeyRepository idempotencyKeys,
                           BackendClient backendClient, FakeCardProvider provider, PaymentResultOutbox outbox,
-                          PaymentSignature signature, Clock paymentClock,
-                          @Value("${payment.settlement-delay:PT10S}") Duration settlementDelay) {
+                          PaymentSignature signature, OrderPaymentLocks orderLocks, Clock paymentClock,
+                          @Value("${payment.settlement-delay:PT10S}") Duration settlementDelay,
+                          @Value("${payment.three-ds-timeout:PT15M}") Duration threeDsTimeout) {
         this.paymentRepository = paymentRepository;
         this.idempotencyKeys = idempotencyKeys;
         this.backendClient = backendClient;
@@ -73,6 +76,8 @@ public class PaymentService {
         this.signature = signature;
         this.paymentClock = paymentClock;
         this.settlementDelay = settlementDelay;
+        this.threeDsTimeout = threeDsTimeout;
+        this.orderLocks = orderLocks;
     }
 
     /** A created payment, or the earlier one when the request is an idempotent replay. */
@@ -82,6 +87,9 @@ public class PaymentService {
     /**
      * Pays an order. Order of checks: Idempotency-Key format (400), replay or conflicting reuse
      * (200 / 409), card number and expiry (400), order exists (404), ownership (403), payable (409).
+     * Everything after the key format runs under the order's payment lock, so concurrent
+     * submissions for one order are serialised: a double submit with the same key becomes a
+     * replay, and only one of two different attempts can become the active payment.
      */
     @Transactional
     public CreateResult create(CustomPrincipal principal, String idempotencyKey, CreatePaymentDto request) {
@@ -89,6 +97,7 @@ public class PaymentService {
             throw new CustomException(INVALID_KEY, HttpStatus.BAD_REQUEST);
         }
         String fingerprint = fingerprint(request);
+        orderLocks.lock(request.orderId());
         Optional<IdempotencyKeyEntity> earlier = idempotencyKeys.findByUsernameAndIdempotencyKey(principal.username(), idempotencyKey);
         if (earlier.isPresent()) {
             if (!earlier.get().getRequestHash().equals(fingerprint)) {
@@ -103,6 +112,7 @@ public class PaymentService {
         }
         BigDecimal amount = order.payableAmount() == null ? BigDecimal.ZERO
                 : order.payableAmount().setScale(2, RoundingMode.HALF_UP);
+        expireAbandonedThreeDs(order.id());
         if (order.status() != OrderStatus.PENDING || amount.signum() <= 0
                 || paymentRepository.existsByOrderIdAndStatusIn(order.id(), PaymentStateMachine.BLOCKING)) {
             throw new CustomException(NOT_PAYABLE, HttpStatus.CONFLICT);
@@ -124,14 +134,21 @@ public class PaymentService {
         return new CreateResult(PaymentDto.from(payment), false);
     }
 
-    /** Answers the 3-D Secure challenge: {@code 123456} captures, anything else fails the payment. */
-    @Transactional
+    /**
+     * Answers the 3-D Secure challenge: {@code 123456} captures, anything else fails the payment.
+     * A challenge past {@code payment.three-ds-timeout} is expired here (committed, so the backend
+     * hears about it) and answered with 409 like any payment that no longer requires action.
+     */
+    @Transactional(noRollbackFor = CustomException.class)
     public PaymentDto completeThreeDs(CustomPrincipal principal, UUID paymentId, String code) {
         PaymentEntity payment = loadVisible(principal, paymentId);
+        LocalDateTime now = LocalDateTime.now(paymentClock);
+        if (PaymentStateMachine.isThreeDsExpired(payment, now)) {
+            expire(payment, now);
+        }
         if (payment.getStatus() != PaymentStatus.REQUIRES_ACTION) {
             throw new CustomException(NO_ACTION_REQUIRED, HttpStatus.CONFLICT);
         }
-        LocalDateTime now = LocalDateTime.now(paymentClock);
         if (provider.threeDsApproved(code)) {
             PaymentStateMachine.capture(payment, now);
         } else {
@@ -188,7 +205,10 @@ public class PaymentService {
                 payment.setFailureCode(decision.failureCode());
                 payment.setFailureMessage(FakeCardProvider.failureMessage(decision.failureCode()));
             }
-            case REQUIRES_ACTION -> payment.setStatus(PaymentStatus.REQUIRES_ACTION);
+            case REQUIRES_ACTION -> {
+                payment.setStatus(PaymentStatus.REQUIRES_ACTION);
+                payment.setSettleAt(now.plus(threeDsTimeout));
+            }
             case SETTLES, TIMES_OUT -> {
                 payment.setStatus(PaymentStatus.PROCESSING);
                 payment.setSettlement(decision.outcome() == ProviderDecision.Outcome.SETTLES
@@ -197,6 +217,23 @@ public class PaymentService {
             }
         }
         return payment;
+    }
+
+    /** Abandoned 3-D Secure challenges must not keep the customer from paying again. */
+    private void expireAbandonedThreeDs(long orderId) {
+        LocalDateTime now = LocalDateTime.now(paymentClock);
+        for (PaymentEntity payment : paymentRepository.findByOrderIdAndStatusAndSettleAtLessThanEqual(orderId,
+                PaymentStatus.REQUIRES_ACTION, now)) {
+            expire(payment, now);
+        }
+    }
+
+    private void expire(PaymentEntity payment, LocalDateTime now) {
+        PaymentStateMachine.fail(payment, FakeCardProvider.THREE_DS_EXPIRED,
+                FakeCardProvider.failureMessage(FakeCardProvider.THREE_DS_EXPIRED), now);
+        paymentRepository.save(payment);
+        outbox.enqueue(payment, 1);
+        log.info("3-D Secure for payment {} expired", payment.getId());
     }
 
     private PaymentEntity loadVisible(CustomPrincipal principal, UUID paymentId) {

@@ -48,6 +48,7 @@ public class FakeBackend implements BackendClient {
     private final List<Delivery> deliveries = new CopyOnWriteArrayList<>();
     private final Deque<Integer> scriptedResultStatuses = new ArrayDeque<>();
     private volatile boolean available = true;
+    private volatile long orderLookupDelayMillis;
 
     /** One received result notification, as the backend would see it on the wire. */
     public record Delivery(long orderId, String rawBody, String signature, long timestamp, boolean signatureValid,
@@ -70,6 +71,12 @@ public class FakeBackend implements BackendClient {
         deliveries.clear();
         scriptedResultStatuses.clear();
         available = true;
+        orderLookupDelayMillis = 0;
+    }
+
+    /** Slows down order lookups, widening the window in which concurrent payments could race. */
+    public void setOrderLookupDelayMillis(long millis) {
+        this.orderLookupDelayMillis = millis;
     }
 
     public void setAvailable(boolean available) {
@@ -109,6 +116,13 @@ public class FakeBackend implements BackendClient {
     @Override
     public InternalOrderDto getOrder(long orderId) {
         call();
+        if (orderLookupDelayMillis > 0) {
+            try {
+                Thread.sleep(orderLookupDelayMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         InternalOrderDto order = orders.get(orderId);
         if (order == null) {
             throw new BackendException("Order not found", HttpStatus.NOT_FOUND, 404, null);
