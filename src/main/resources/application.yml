@@ -1,0 +1,90 @@
+spring:
+  application:
+    name: payment-service
+  # PostgreSQL by default; SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD override it.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/testdb?currentSchema=payment
+    username: postgres
+    password: postgres
+    hikari:
+      # Small footprint: the backend's Postgres is shared and memory-capped.
+      maximum-pool-size: 3
+      minimum-idle: 1
+      idle-timeout: 120000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: payment
+  flyway:
+    enabled: true
+    schemas: payment
+    default-schema: payment
+    create-schemas: true
+  jmx:
+    enabled: false
+  main:
+    banner-mode: "off"
+
+server:
+  port: 4004
+  tomcat:
+    threads:
+      max: 20
+      min-spare: 2
+    accept-count: 50
+    max-connections: 200
+  error:
+    include-message: never
+    include-binding-errors: never
+    include-stacktrace: never
+
+backend:
+  base-url: ${BACKEND_BASE_URL:http://localhost:4001}
+  connect-timeout: 2s
+  read-timeout: 10s
+
+payment:
+  # X-Service-Token for both directions: payment-service -> backend internal API and
+  # backend -> /internal/v1/payments/refunds. Blank disables the refund endpoint (404).
+  service-token: ${PAYMENT_SERVICE_TOKEN:local-payment-token}
+  # HMAC-SHA256 key for the X-Payment-Signature header of result notifications.
+  webhook-secret: ${PAYMENT_WEBHOOK_SECRET:local-payment-webhook-secret}
+  # Simulated provider: PROCESSING test cards settle (or time out) after this delay.
+  settlement-delay: ${PAYMENT_SETTLEMENT_DELAY:PT10S}
+  settlement:
+    enabled: ${PAYMENT_SETTLEMENT_ENABLED:true}
+    interval: ${PAYMENT_SETTLEMENT_INTERVAL:PT2S}
+  # Retries result notifications from the outbox that the backend did not accept.
+  notifications:
+    retry-enabled: ${PAYMENT_NOTIFICATIONS_RETRY_ENABLED:true}
+    retry-interval: ${PAYMENT_NOTIFICATIONS_RETRY_INTERVAL:PT30S}
+
+security:
+  jwt:
+    # Access tokens are RS256-signed by the backend and verified with the keys it
+    # publishes at /internal/v1/jwks.json; an unknown key id refetches them at most
+    # this often.
+    jwks-refresh-interval: ${JWT_JWKS_REFRESH_INTERVAL:10s}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE:health,prometheus}
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  # The internal refund endpoint is service-to-service only.
+  paths-to-exclude: /internal/**
+
+logging:
+  level:
+    root: INFO

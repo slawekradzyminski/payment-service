@@ -1,0 +1,15 @@
+# Postgres schema "payment" in the shared database; backend in the Compose network.
+# SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD override the defaults below.
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/testdb?currentSchema=payment
+    username: postgres
+    password: postgres
+
+backend:
+  base-url: ${BACKEND_BASE_URL:http://backend:4001}
+
+payment:
+  # Required: the backend disables the payment caller when its token is unset.
+  service-token: ${PAYMENT_SERVICE_TOKEN}
+  webhook-secret: ${PAYMENT_WEBHOOK_SECRET}

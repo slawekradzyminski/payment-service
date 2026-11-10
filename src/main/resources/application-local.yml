@@ -1,0 +1,16 @@
+# Local run next to the backend's local profile: the same PostgreSQL database
+# (localhost:5432/testdb, schema "payment"):
+#   ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
+# Override with SPRING_DATASOURCE_URL / _USERNAME / _PASSWORD.
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/testdb?currentSchema=payment
+    username: postgres
+    password: postgres
+
+backend:
+  base-url: ${BACKEND_BASE_URL:http://localhost:4001}
+
+payment:
+  service-token: ${PAYMENT_SERVICE_TOKEN:local-payment-token}
+  webhook-secret: ${PAYMENT_WEBHOOK_SECRET:local-payment-webhook-secret}

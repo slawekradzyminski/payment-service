@@ -1,0 +1,16 @@
+# JVM tests run on H2 in memory (the H2 driver is test-scoped).
+spring:
+  datasource:
+    url: jdbc:h2:mem:payment-test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password: ""
+
+payment:
+  service-token: test-service-token
+  webhook-secret: test-webhook-secret
+  settlement-delay: PT10S
+  # Scheduled jobs are driven explicitly by the tests.
+  settlement:
+    enabled: false
+  notifications:
+    retry-enabled: false
