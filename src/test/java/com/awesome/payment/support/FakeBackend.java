@@ -3,6 +3,8 @@ package com.awesome.payment.support;
 import com.awesome.payment.client.BackendClient;
 import com.awesome.payment.client.BackendErrorMapper;
 import com.awesome.payment.client.BackendException;
+import com.awesome.payment.client.EventFeedPage;
+import com.awesome.payment.client.FeedEvent;
 import com.awesome.payment.client.InternalOrderDto;
 import com.awesome.payment.client.JwkSet;
 import com.awesome.payment.client.OrderStatus;
@@ -31,8 +33,9 @@ import java.util.regex.Pattern;
 /**
  * In-memory backend implementing the contract's payment-result rules (signature check with
  * five-minute skew, idempotency per requestId, amountDue check, PENDING to PAID, 409 "Order
- * is not payable"), so flow tests run without Docker or HTTP. The signature is verified with
- * an independent HMAC implementation.
+ * is not payable") and the domain event feed ({@code GET /internal/v1/events}: sequence order,
+ * {@code after}/{@code limit}/{@code types}, {@code nextCursor}/{@code hasMore}), so flow tests
+ * run without Docker or HTTP. The signature is verified with an independent HMAC implementation.
  */
 public class FakeBackend implements BackendClient {
 
@@ -47,12 +50,19 @@ public class FakeBackend implements BackendClient {
     private final Map<UUID, PaymentResultResponse> handled = new ConcurrentHashMap<>();
     private final List<Delivery> deliveries = new CopyOnWriteArrayList<>();
     private final Deque<Integer> scriptedResultStatuses = new ArrayDeque<>();
+    private final List<FeedEvent> feed = new CopyOnWriteArrayList<>();
+    private final List<FeedRequest> feedRequests = new CopyOnWriteArrayList<>();
+    private final AtomicLong sequences = new AtomicLong();
     private volatile boolean available = true;
     private volatile long orderLookupDelayMillis;
 
     /** One received result notification, as the backend would see it on the wire. */
     public record Delivery(long orderId, String rawBody, String signature, long timestamp, boolean signatureValid,
                            JsonNode body) {
+    }
+
+    /** One {@code GET /internal/v1/events} call as the backend would see its query parameters. */
+    public record FeedRequest(long after, int limit, List<String> types) {
     }
 
     public FakeBackend() {
@@ -70,6 +80,9 @@ public class FakeBackend implements BackendClient {
         handled.clear();
         deliveries.clear();
         scriptedResultStatuses.clear();
+        feed.clear();
+        feedRequests.clear();
+        sequences.set(0);
         available = true;
         orderLookupDelayMillis = 0;
     }
@@ -174,6 +187,48 @@ public class FakeBackend implements BackendClient {
             paidBy.put(orderId, paymentId);
         }
         return remember(requestId, getOrder(orderId));
+    }
+
+    /** Appends a domain event to the feed and returns it (sequence assigned in order). */
+    public FeedEvent publish(String type, Long orderId, Map<String, Object> data) {
+        return publish(UUID.randomUUID(), type, orderId, data);
+    }
+
+    public FeedEvent publish(UUID eventId, String type, Long orderId, Map<String, Object> data) {
+        FeedEvent event = new FeedEvent(sequences.incrementAndGet(), eventId, type, clock.instant().toString(), orderId,
+                "client", JSON.valueToTree(data));
+        feed.add(event);
+        return event;
+    }
+
+    /** Re-appends an already published event (same id) under a new sequence, like a redelivery. */
+    public FeedEvent republish(FeedEvent event) {
+        FeedEvent copy = new FeedEvent(sequences.incrementAndGet(), event.id(), event.type(), event.occurredAt(),
+                event.orderId(), event.username(), event.data());
+        feed.add(copy);
+        return copy;
+    }
+
+    public List<FeedRequest> feedRequests() {
+        return List.copyOf(feedRequests);
+    }
+
+    /**
+     * Matching events after {@code after}, at most {@code limit}. {@code nextCursor} is the last
+     * returned sequence on a full page, otherwise the feed's last sequence (events of other types
+     * are skipped over); {@code hasMore} is true when matching events remain.
+     */
+    @Override
+    public EventFeedPage events(long after, int limit, List<String> types) {
+        call();
+        feedRequests.add(new FeedRequest(after, limit, List.copyOf(types)));
+        List<FeedEvent> matching = feed.stream()
+                .filter(e -> e.sequence() > after && (types.isEmpty() || types.contains(e.type())))
+                .toList();
+        List<FeedEvent> page = matching.stream().limit(limit).toList();
+        boolean hasMore = matching.size() > page.size();
+        long next = hasMore ? page.getLast().sequence() : Math.max(after, sequences.get());
+        return new EventFeedPage(page, next, hasMore);
     }
 
     @Override

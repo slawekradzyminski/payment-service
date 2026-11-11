@@ -11,7 +11,7 @@
 
     <groupId>com.awesome</groupId>
     <artifactId>payment-service</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <name>payment-service</name>
@@ -337,13 +337,14 @@
                                 <param>com.awesome.payment.service.notification.PaymentSignature</param>
                                 <param>com.awesome.payment.service.notification.PaymentResultOutbox</param>
                                 <param>com.awesome.payment.service.notification.PaymentResultDispatcher</param>
-                                <param>com.awesome.payment.security.ServiceTokenFilter</param>
+                                <param>com.awesome.payment.events.EventFeedPoller</param>
+                                <param>com.awesome.payment.events.CardRefundRequestedHandler</param>
                             </targetClasses>
                             <targetTests>
                                 <param>com.awesome.payment.service.*Test</param>
                                 <param>com.awesome.payment.service.provider.*Test</param>
                                 <param>com.awesome.payment.service.notification.*Test</param>
-                                <param>com.awesome.payment.security.ServiceTokenFilterTest</param>
+                                <param>com.awesome.payment.events.*Test</param>
                                 <param>com.awesome.payment.endpoints.*Test</param>
                             </targetTests>
                             <threads>4</threads>

@@ -39,7 +39,7 @@ import java.util.UUID;
 @SecurityRequirement(name = "bearerAuth")
 @ApiResponse(responseCode = "401", description = "Unauthorized",
         content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
-@ApiResponse(responseCode = "403", description = "Not your order or payment, or role not allowed",
+@ApiResponse(responseCode = "403", description = "Role not allowed, or paying another user's order",
         content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
 public class PaymentController {
 
@@ -90,7 +90,7 @@ public class PaymentController {
     @ApiResponse(responseCode = "200", description = "Challenge answered")
     @ApiResponse(responseCode = "400", description = "Missing code",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ValidationErrorsDto.class)))
-    @ApiResponse(responseCode = "404", description = "Payment not found",
+    @ApiResponse(responseCode = "404", description = "Payment not found (or another user's payment)",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
     @ApiResponse(responseCode = "409", description = "Payment is not REQUIRES_ACTION",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
@@ -102,9 +102,10 @@ public class PaymentController {
     }
 
     @GetMapping("/api/v1/payments/{id}")
-    @Operation(summary = "Get a payment", description = "Returns one of the caller's payments; admins see any payment.")
+    @Operation(summary = "Get a payment", description = "Returns one of the caller's payments; admins see any payment. "
+            + "Another user's payment is answered 404 like a missing one.")
     @ApiResponse(responseCode = "200", description = "Payment found")
-    @ApiResponse(responseCode = "404", description = "Payment not found",
+    @ApiResponse(responseCode = "404", description = "Payment not found (or another user's payment)",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
     public PaymentDto get(
             @Parameter(hidden = true) @AuthenticationPrincipal CustomPrincipal principal,
@@ -114,11 +115,12 @@ public class PaymentController {
 
     @GetMapping("/api/v1/orders/{orderId}/payments")
     @Operation(summary = "List an order's payments",
-            description = "Lists every payment attempt for the caller's order, newest first; admins see any order.")
+            description = "Lists every payment attempt for the caller's order, newest first; admins see any order. "
+                    + "Another user's order is answered 404 like a missing one.")
     @ApiResponse(responseCode = "200", description = "Payments listed",
             content = @Content(mediaType = "application/json",
                     array = @ArraySchema(schema = @Schema(implementation = PaymentDto.class))))
-    @ApiResponse(responseCode = "404", description = "Order not found",
+    @ApiResponse(responseCode = "404", description = "Order not found (or another user's order)",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
     @ApiResponse(responseCode = "503", description = "Backend unavailable",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))

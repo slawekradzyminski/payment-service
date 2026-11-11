@@ -1,5 +1,7 @@
 package com.awesome.payment.config;
 
+import com.awesome.payment.client.EventFeedPage;
+import com.awesome.payment.client.FeedEvent;
 import com.awesome.payment.client.InternalOrderDto;
 import com.awesome.payment.client.JwkSet;
 import com.awesome.payment.client.OrderStatus;
@@ -23,7 +25,8 @@ import java.util.UUID;
  * running image does no classpath scanning.
  *
  * <ul>
- *   <li>Internal-API records are (de)serialised by Jackson through {@code RestClient}
+ *   <li>Internal-API records (including the event feed page and its events, whose {@code data}
+ *       stays a {@code JsonNode}) are (de)serialised by Jackson through {@code RestClient}
  *       (and the result payload by the outbox's own {@code JsonMapper}), which AOT cannot
  *       infer from controller signatures.</li>
  *   <li>JJWT's API module instantiates its implementation classes by name
@@ -46,6 +49,8 @@ import java.util.UUID;
     PaymentResultResponse.class,
     JwkSet.class,
     JwkSet.Jwk.class,
+    EventFeedPage.class,
+    FeedEvent.class,
     PageDto.class,
     ErrorDto.class
 })

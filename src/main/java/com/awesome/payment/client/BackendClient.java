@@ -1,5 +1,7 @@
 package com.awesome.payment.client;
 
+import java.util.List;
+
 /**
  * Backend internal API ({@code /internal/v1}). Implementations translate backend
  * failures into {@link BackendException}s: a 4xx keeps its status and message, any
@@ -18,4 +20,10 @@ public interface BackendClient {
 
     /** The backend's access-token verification keys. */
     JwkSet jwks();
+
+    /**
+     * One page of the backend's domain event feed ({@code GET /internal/v1/events}): events with a
+     * sequence greater than {@code after}, at most {@code limit}, restricted to the given wire names.
+     */
+    EventFeedPage events(long after, int limit, List<String> types);
 }

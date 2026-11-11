@@ -2,25 +2,28 @@
 
 Simulated card payments for the Awesome Testing stack: a fake card provider with
 deterministic test cards, 3-D Secure, asynchronous settlement, signed result
-notifications to the backend and card refunds. The backend keeps users, JWT
-issuance and orders; this service decides whether a card payment succeeds and
-tells the backend.
+notifications to the backend and card refunds read from the backend's event feed.
+The backend keeps users, JWT issuance and orders; this service decides whether a
+card payment succeeds and tells the backend. The backend never calls this service.
 
-- Contract: "Payments" section of the commerce-wave contract (`CONTRACTS.md`)
+- Contract: "Payments" and "Event feed" sections of the commerce-wave contract (`CONTRACTS.md`)
 - Stack: Spring Boot 4.1 / Java 25, Spring AOT, GraalVM native image
 - Port: 4004 · OpenAPI: `/v3/api-docs` (gateway: `/payment/v3/api-docs`) · Health: `/actuator/health` · Metrics: `/actuator/prometheus`
 
 ## Public API
 
 All public endpoints need a backend access token with `ROLE_CLIENT` or `ROLE_ADMIN`;
-clients see only their own orders and payments, admins see everything.
+clients see only their own orders and payments, admins see everything. Reading another
+user's payment or order payments is answered 404 exactly like a missing one (as the
+backend does), so the existence of other users' orders is not revealed; only paying
+another user's order is 403, as the contract specifies.
 
 | Endpoint | Result |
 | --- | --- |
 | `POST /api/v1/payments` (header `Idempotency-Key`, `^[A-Za-z0-9_-]{8,64}$`) | 201 `PaymentDto`; replay 200 + `Idempotent-Replayed: true`; 400 validation / Luhn / expired / bad key; 403 not your order; 404 order; 409 not payable or key reused with another body; 503 backend down |
-| `POST /api/v1/payments/{id}/3ds` `{code}` | 200; `123456` captures, anything else fails with `THREE_DS_FAILED`; 409 when not `REQUIRES_ACTION` |
-| `GET /api/v1/payments/{id}` | 200 / 403 / 404 |
-| `GET /api/v1/orders/{orderId}/payments` | payments of the order, newest first (the order is read from the backend: 404 / 403) |
+| `POST /api/v1/payments/{id}/3ds` `{code}` | 200; `123456` captures, anything else fails with `THREE_DS_FAILED`; 404 missing or another user's payment; 409 when not `REQUIRES_ACTION` |
+| `GET /api/v1/payments/{id}` | 200 / 404 (missing, or another user's payment) |
+| `GET /api/v1/orders/{orderId}/payments` | payments of the order, newest first (the order is read from the backend; 404 "Order not found" when it is missing or another user's) |
 | `GET /api/v1/admin/payments?status&page&size` | `ROLE_ADMIN`; page `{content,pageNumber,pageSize,totalElements,totalPages}`, newest first, size 1-100 (default 20) |
 
 `PaymentDto {id, orderId, status, amount, currency, cardBrand, cardLast4, failureCode, failureMessage, nextAction, refundedAmount, createdAt, updatedAt}`;
@@ -79,7 +82,9 @@ do not consume the key.
   `{requestId, paymentId, status: CAPTURED|FAILED, amount, currency, failureCode}`, header
   `X-Payment-Signature: t=<epochSeconds>,v1=<hex HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, t + "." + rawBody)>`.
   The stored body is sent byte for byte and re-signed on every attempt.
-- `GET /internal/v1/jwks.json`: access-token verification keys.
+- `GET /internal/v1/jwks.json`: access-token verification keys;
+- `GET /internal/v1/events?after={cursor}&limit=100&types=card-refund.requested`: the domain event feed
+  `{events:[{sequence, id, type, occurredAt, orderId, username, data}], nextCursor, hasMore}`.
 
 Results go through a transactional outbox (`payment_outbox`): written with the
 payment change, sent right after the commit, and retried every 30 seconds with
@@ -94,18 +99,30 @@ verified with the public keys from the backend's JWKS, cached by `kid` and refet
 for an unknown `kid` at most once per `JWT_JWKS_REFRESH_INTERVAL`; HMAC tokens are
 rejected. 401/403 bodies are `{"message": ...}`.
 
-### Internal refund API (backend only, not in OpenAPI)
+### Card refunds from the event feed
 
-`POST /internal/v1/payments/refunds` with `X-Service-Token: PAYMENT_SERVICE_TOKEN`
-(constant-time compare; missing or wrong: 401; blank configured token: 404),
-body `{requestId, orderId, amount, reason}` → 200 `{refundId, paymentId, amount, status}`
-where `status` is the payment status after the refund (`PARTIALLY_REFUNDED` or
-`REFUNDED`). Idempotent per `requestId` (a repeat returns the first answer).
-404 when the order has no captured payment, 409 when the amount exceeds what is
-still refundable.
+The backend publishes `card-refund.requested` (data `{requestId, orderId, amount, reason}`)
+when a booked refund has a card leg or a card-paid order is cancelled. `EventFeedPoller`
+reads the feed every `payment.events.poll-interval` (default 5 s) from its cursor
+(`event_cursors`, consumer `payment-service`), asking only for `card-refund.requested`,
+up to 20 pages of 100 per poll. Each event is handled in one local transaction that
+books the refund, records the event id in `processed_events` and advances the cursor:
 
-Local tables (Flyway `V1`–`V2`, schema `payment`): `payments`, `payment_idempotency_keys`,
-`payment_outbox`, `refunds`, `order_payment_locks`.
+- the same event id again (redelivery, rewound cursor) is skipped;
+- the same `requestId` in another event books nothing (idempotent per `requestId`);
+- an order without a captured card payment books nothing (logged);
+- an amount above what is still refundable books nothing (logged as a warning);
+- a malformed payload or any other non-transient failure is logged with the event id
+  and skipped (recorded as processed, cursor advances), so the feed is never blocked;
+- the backend being unavailable (or a transient database failure) stops the poll
+  without moving the cursor; the next poll retries.
+
+A refund leaves the payment `PARTIALLY_REFUNDED` or `REFUNDED`. payment-service has
+no inbound internal API any more (the 1.0.0 `POST /internal/v1/payments/refunds`
+endpoint and its service-token filter were removed).
+
+Local tables (Flyway `V1`–`V3`, schema `payment`): `payments`, `payment_idempotency_keys`,
+`payment_outbox`, `refunds`, `order_payment_locks`, `event_cursors`, `processed_events`.
 
 ## Run
 
@@ -132,12 +149,13 @@ Profiles:
 | --- | --- | --- |
 | `SPRING_PROFILES_ACTIVE` | active profiles | none (Postgres on localhost) |
 | `BACKEND_BASE_URL` | `backend.base-url` | `http://localhost:4001` (`http://backend:4001` in `docker`) |
-| `PAYMENT_SERVICE_TOKEN` | `payment.service-token` | `local-payment-token`; no default in `docker`; blank disables the refund API and sends backend calls without a token |
+| `PAYMENT_SERVICE_TOKEN` | `payment.service-token` | `local-payment-token`; no default in `docker`; `X-Service-Token` on every backend call (blank sends none, and the backend refuses them) |
 | `PAYMENT_WEBHOOK_SECRET` | `payment.webhook-secret` | `local-payment-webhook-secret`; no default in `docker`; must not be blank |
 | `PAYMENT_SETTLEMENT_DELAY` | `payment.settlement-delay` | `PT10S` |
 | `PAYMENT_THREE_DS_TIMEOUT` | `payment.three-ds-timeout` | `PT15M` (unanswered challenges fail with `THREE_DS_EXPIRED`) |
 | `PAYMENT_SETTLEMENT_ENABLED` / `_INTERVAL` | `payment.settlement.*` | `true` / `PT2S` |
 | `PAYMENT_NOTIFICATIONS_RETRY_ENABLED` / `_RETRY_INTERVAL` | `payment.notifications.*` | `true` / `PT30S` |
+| `PAYMENT_EVENTS_ENABLED` / `PAYMENT_EVENTS_POLL_INTERVAL` | `payment.events.enabled` / `.poll-interval` | `true` / `PT5S` (event feed poller) |
 | `JWT_JWKS_REFRESH_INTERVAL` | `security.jwt.jwks-refresh-interval` | `10s` |
 | `SPRING_DATASOURCE_URL` / `_USERNAME` / `_PASSWORD` | datasource | see profiles |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | actuator exposure | `health,prometheus` |
@@ -151,8 +169,9 @@ Profiles:
 
 No Docker, Postgres or backend is needed. Flow tests boot the service on H2 (`test`
 profile) with `FakeBackend`, an in-memory implementation of the backend's result
-rules that verifies the signature independently, and a `MutableClock`. The
-settlement job and the outbox retry are switched off in tests and driven explicitly.
+rules that verifies the signature independently and serves an in-memory event feed,
+and a `MutableClock`. The settlement job, the outbox retry and the event feed poller
+are switched off in tests and driven explicitly.
 `RestBackendClientContractTest` pins every internal-API request with
 `MockRestServiceServer`.
 
@@ -176,4 +195,4 @@ tag-triggered `publish-image.yml`. `Dockerfile.jvm` builds a JVM fallback image.
 - PITest: `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage`
   (scope: `CardChecks`, `FakeCardProvider`, `PaymentStateMachine`, `PaymentService`,
   `SettlementJob`, `RefundService`, `OrderPaymentLocks`, `PaymentSignature`, `PaymentResultOutbox`,
-  `PaymentResultDispatcher`, `ServiceTokenFilter`). Advisory, not a gate.
+  `PaymentResultDispatcher`, `EventFeedPoller`, `CardRefundRequestedHandler`). Advisory, not a gate.

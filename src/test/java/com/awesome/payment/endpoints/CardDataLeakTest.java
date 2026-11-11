@@ -21,7 +21,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CardDataLeakTest extends AbstractFlowTest {
 
     private static final List<String> TABLES = List.of("payments", "payment_idempotency_keys", "payment_outbox",
-            "refunds");
+            "refunds", "processed_events", "event_cursors");
 
     @Autowired
     private JdbcTemplate jdbc;
