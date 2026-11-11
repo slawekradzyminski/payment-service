@@ -42,6 +42,14 @@ public class PaymentOutboxEntity {
     @Column(nullable = false, length = 2000)
     private String payload;
 
+    /** {@code X-Request-Id} of the request that created the payment, sent with the notification. */
+    @Column(name = "correlation_request_id", length = 128)
+    private String correlationRequestId;
+
+    /** {@code traceparent} of that request; the notification carries a child of it. */
+    @Column(length = 55)
+    private String traceparent;
+
     @Column(nullable = false)
     private int attempts;
 

@@ -4,6 +4,7 @@ import com.awesome.payment.client.BackendClient;
 import com.awesome.payment.client.InternalOrderDto;
 import com.awesome.payment.client.OrderStatus;
 import com.awesome.payment.controller.exception.CustomException;
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.dto.payment.CardDto;
 import com.awesome.payment.dto.payment.CreatePaymentDto;
 import com.awesome.payment.dto.payment.PaymentDto;
@@ -200,6 +201,8 @@ public class PaymentService {
                 .currency(CURRENCY)
                 .cardBrand(decision.brand())
                 .cardLast4(decision.last4())
+                .correlationRequestId(Correlation.currentRequestId())
+                .traceparent(Correlation.currentTraceparent())
                 .createdAt(now)
                 .updatedAt(now)
                 .build();

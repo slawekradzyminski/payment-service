@@ -1,5 +1,6 @@
 package com.awesome.payment.service;
 
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.entity.PaymentEntity;
 import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.entity.Settlement;
@@ -25,6 +26,8 @@ import java.util.UUID;
  * {@code payment.settlement-delay} has passed are captured, or fail with PROVIDER_TIMEOUT;
  * REQUIRES_ACTION payments older than {@code payment.three-ds-timeout} fail with
  * THREE_DS_EXPIRED. Each result is queued for the backend. Disabled with {@code payment.settlement.enabled}.
+ * Each payment is settled (and its result delivered) under the correlation ids of the request that
+ * created it, so its log lines and the notification share that request's trace.
  */
 @Slf4j
 @Component
@@ -56,20 +59,25 @@ public class SettlementJob {
         }
     }
 
+    /** A due payment and the correlation ids of the request that created it. */
+    private record Due(UUID id, String requestId, String traceId) {
+    }
+
     /** Settles every due payment, each in its own transaction; returns how many were settled. */
     public synchronized int settleDue() {
-        List<UUID> due = transaction.execute(status -> paymentRepository
+        List<Due> due = transaction.execute(status -> paymentRepository
                 .findDueForSettlement(LocalDateTime.now(paymentClock), PageRequest.of(0, BATCH_SIZE))
-                .stream().map(PaymentEntity::getId).toList());
+                .stream().map(p -> new Due(p.getId(), p.getCorrelationRequestId(),
+                        Correlation.traceIdOf(p.getTraceparent()))).toList());
         int settled = 0;
-        for (UUID id : due == null ? List.<UUID>of() : due) {
-            try {
-                Boolean done = transaction.execute(status -> settle(id));
+        for (Due payment : due == null ? List.<Due>of() : due) {
+            try (Correlation.Scope ignored = Correlation.open(payment.requestId(), payment.traceId())) {
+                Boolean done = transaction.execute(status -> settle(payment.id()));
                 if (Boolean.TRUE.equals(done)) {
                     settled++;
                 }
             } catch (ObjectOptimisticLockingFailureException e) {
-                log.info("Payment {} changed while settling; left for the next run", id);
+                log.info("Payment {} changed while settling; left for the next run", payment.id());
             }
         }
         return settled;

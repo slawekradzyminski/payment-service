@@ -73,6 +73,14 @@ public class PaymentEntity {
     @Column(name = "settle_at")
     private LocalDateTime settleAt;
 
+    /** {@code X-Request-Id} of the request that created the payment (null for rows before 1.2.0). */
+    @Column(name = "correlation_request_id", length = 128)
+    private String correlationRequestId;
+
+    /** {@code traceparent} of this service's span of that request. */
+    @Column(length = 55)
+    private String traceparent;
+
     @Version
     private Long version;
 

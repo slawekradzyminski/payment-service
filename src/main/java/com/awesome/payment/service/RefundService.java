@@ -1,5 +1,6 @@
 package com.awesome.payment.service;
 
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.entity.PaymentEntity;
 import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.entity.RefundEntity;
@@ -21,7 +22,8 @@ import java.util.UUID;
  * Card refunds the backend requested ({@code card-refund.requested} feed events). Idempotent per
  * requestId: a repeated request books nothing and reports the first refund. An order without a
  * captured card payment, or an amount above the refundable rest, books nothing either. None of
- * these outcomes throws, so the caller's transaction (the feed event) always commits.
+ * these outcomes throws, so the caller's transaction (the feed event) always commits. A booked
+ * refund keeps the request id and trace id of the backend request behind the event (from the MDC).
  */
 @Slf4j
 @Service
@@ -80,6 +82,8 @@ public class RefundService {
                 .amount(amount)
                 .reason(request.reason())
                 .paymentStatus(status)
+                .correlationRequestId(Correlation.currentRequestId())
+                .traceId(Correlation.currentTraceId())
                 .createdAt(now)
                 .build());
         log.info("Refunded {} of payment {} for order {}: {}", refund.getAmount(), payment.getId(),

@@ -43,6 +43,14 @@ public class RefundEntity {
 
     private String reason;
 
+    /** {@code X-Request-Id} of the backend request whose feed event booked this refund. */
+    @Column(name = "correlation_request_id", length = 128)
+    private String correlationRequestId;
+
+    /** Trace id of that backend request. */
+    @Column(name = "trace_id", length = 32)
+    private String traceId;
+
     /** Payment status right after this refund (PARTIALLY_REFUNDED or REFUNDED). */
     @Enumerated(EnumType.STRING)
     @Column(name = "payment_status", nullable = false, length = 32)

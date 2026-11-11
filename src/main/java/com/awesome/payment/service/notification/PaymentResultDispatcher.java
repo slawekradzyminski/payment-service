@@ -2,6 +2,7 @@ package com.awesome.payment.service.notification;
 
 import com.awesome.payment.client.BackendClient;
 import com.awesome.payment.client.BackendException;
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.entity.PaymentOutboxEntity;
 import com.awesome.payment.repository.PaymentOutboxRepository;
 import com.awesome.payment.repository.PaymentRepository;
@@ -29,7 +30,9 @@ import java.util.function.Consumer;
  * commits, and again on a schedule for those that failed. No response or a 5xx is retried with
  * exponential backoff (30 s doubling to 30 min, at most {@value #MAX_ATTEMPTS} attempts). A 409
  * ("Order is not payable") to a capture voids the payment. Any other rejection is final. The
- * backend handles each requestId once, so a retry after a lost response is harmless.
+ * backend handles each requestId once, so a retry after a lost response is harmless. Each delivery
+ * runs (and logs) under the correlation ids stored with the row, so the backend receives the
+ * original {@code X-Request-Id} and a child of the original trace.
  */
 @Slf4j
 @Component
@@ -92,6 +95,20 @@ public class PaymentResultDispatcher {
     }
 
     private boolean send(PaymentOutboxEntity row) {
+        try (Correlation.Scope ignored = correlation(row)) {
+            return deliver(row);
+        }
+    }
+
+    /** The row's ids; a row without any (written before 1.2.0) keeps the current trace. */
+    private static Correlation.Scope correlation(PaymentOutboxEntity row) {
+        if (row.getCorrelationRequestId() == null && row.getTraceparent() == null) {
+            return Correlation.open(Correlation.currentRequestId(), Correlation.currentTraceId());
+        }
+        return Correlation.open(row.getCorrelationRequestId(), Correlation.traceIdOf(row.getTraceparent()));
+    }
+
+    private boolean deliver(PaymentOutboxEntity row) {
         try {
             backendClient.sendPaymentResult(row.getOrderId(), row.getPayload(), signature.sign(row.getPayload()));
             update(row.getId(), delivered -> delivered.setSentAt(LocalDateTime.now(paymentClock)));

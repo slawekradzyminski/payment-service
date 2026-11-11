@@ -26,6 +26,11 @@ documentation, code comments, test names, commit messages and handoff notes.
   skip the event). Transient failures leave the cursor; others skip the event.
 - Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
+- Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first and owns
+  the MDC keys `requestId`/`traceId`/`spanId`; `CorrelationInterceptor` (in `RestBackendClient`)
+  sends `X-Request-Id` and a child `traceparent` on every backend call. Work that runs outside a
+  request (outbox delivery, settlement, feed events) must open a `Correlation.open(...)` scope
+  from the stored or received ids and close it; never leave MDC values behind on a pooled thread.
 
 # Verification Commands
 
@@ -90,5 +95,6 @@ explicitly (`EventFeedPoller.poll()`).
   migrations, JWT validation, card payments, idempotent replay, 3-D Secure,
   scheduled settlement, the signed result notification, a card refund read from the
   stub's event feed (types filter, cursor), 404 for other users' payments and orders,
-  health, metrics, OpenAPI and that no card number reaches the log. CI runs it on every push and
+  health, metrics, OpenAPI, correlation ids (response header, notification headers, ECS JSON
+  log fields with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`) and that no card number reaches the log. CI runs it on every push and
   pull request.

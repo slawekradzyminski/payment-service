@@ -121,7 +121,35 @@ A refund leaves the payment `PARTIALLY_REFUNDED` or `REFUNDED`. payment-service 
 no inbound internal API any more (the 1.0.0 `POST /internal/v1/payments/refunds`
 endpoint and its service-token filter were removed).
 
-Local tables (Flyway `V1`–`V3`, schema `payment`): `payments`, `payment_idempotency_keys`,
+### Correlation ids and logging
+
+Every request passes `CorrelationFilter` first: a valid incoming `X-Request-Id`
+(1–128 characters of `[A-Za-z0-9._-]`) is kept, anything else is replaced by a generated
+UUID; the trace id of a valid W3C `traceparent` (`00-<32 hex>-<16 hex>-<2 hex>`, ids not all
+zeros) is kept, otherwise a new trace starts. The MDC holds `requestId`, `traceId` and
+`spanId` (a new span per hop) while the request runs, and the response always carries
+`X-Request-Id` (also on 401/403). Every backend call sends the same `X-Request-Id` and a
+child `traceparent` (same trace id, new parent id); a call without a context (a scheduled
+feed poll) starts fresh ids.
+
+The ids survive persisted hand-offs (Flyway `V4`, nullable columns):
+
+- a payment stores `correlation_request_id` and `traceparent` of the request that created it;
+- its result-outbox rows copy them, and every delivery (right after the commit, from the
+  settlement job that finishes an asynchronous or expired payment, or from the retry job)
+  runs and logs under them, so the backend receives the original `X-Request-Id` and a child
+  of the original trace;
+- a `card-refund.requested` feed event's optional `requestId` / `traceId` are put into the
+  MDC while it is handled (invalid values are ignored), so the card refund logs with the
+  trace of the cancel/refund request that caused it, and the refund row keeps them
+  (`correlation_request_id`, `trace_id`).
+
+Plain console lines carry `[traceId,requestId]` (`logging.pattern.correlation`).
+`LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs` (set by the server Compose file) switches to
+Spring Boot's ECS JSON, one object per line with `requestId`, `traceId` and `spanId` as
+fields; this works in the native image (checked by the smoke test).
+
+Local tables (Flyway `V1`–`V4`, schema `payment`): `payments`, `payment_idempotency_keys`,
 `payment_outbox`, `refunds`, `order_payment_locks`, `event_cursors`, `processed_events`.
 
 ## Run
@@ -159,6 +187,7 @@ Profiles:
 | `JWT_JWKS_REFRESH_INTERVAL` | `security.jwt.jwks-refresh-interval` | `10s` |
 | `SPRING_DATASOURCE_URL` / `_USERNAME` / `_PASSWORD` | datasource | see profiles |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | actuator exposure | `health,prometheus` |
+| `LOGGING_STRUCTURED_FORMAT_CONSOLE` | `logging.structured.format.console` | unset (plain lines with `[traceId,requestId]`); `ecs` for JSON lines |
 
 ## Test
 
@@ -173,13 +202,17 @@ rules that verifies the signature independently and serves an in-memory event fe
 and a `MutableClock`. The settlement job, the outbox retry and the event feed poller
 are switched off in tests and driven explicitly.
 `RestBackendClientContractTest` pins every internal-API request with
-`MockRestServiceServer`.
+`MockRestServiceServer`, including the `X-Request-Id` and child `traceparent` headers.
+`FakeBackend` records the correlation each call was made under, `CorrelationFlowTest`
+follows the ids through payments, settlement, retries and feed refunds, and
+`StructuredLoggingFlowTest` attaches the ECS encoder to check the JSON fields and that no
+JSON line contains a card number or CVC (`CardDataLeakTest` checks the plain lines).
 
 ## Native image
 
 ```bash
 docker build -t payment-service:local .          # needs ~9 GB for the builder (Docker VM >= 12 GB)
-scripts/native-smoke.sh payment-service:local    # Postgres + busybox backend stub, 160 MiB limit
+scripts/native-smoke.sh payment-service:local    # Postgres + busybox backend stub, 160 MiB limit, ECS JSON logs
 ```
 
 The build stage (`ghcr.io/graalvm/native-image-community:25`) runs

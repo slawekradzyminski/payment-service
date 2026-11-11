@@ -1,5 +1,6 @@
 package com.awesome.payment.service.notification;
 
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.entity.PaymentEntity;
 import com.awesome.payment.entity.PaymentOutboxEntity;
 import com.awesome.payment.entity.PaymentStatus;
@@ -66,6 +67,40 @@ class PaymentResultOutboxTest {
         assertThat(rows.get(0).getRequestId()).isEqualTo(rows.get(1).getRequestId());
         assertThat(rows.get(0).getPayload()).isEqualTo(rows.get(1).getPayload()).contains("\"failureCode\":null");
         verify(events, times(1)).publishEvent(any(PaymentResultOutbox.Enqueued.class));
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource(value = {
+        "create-req, 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "create-req, NULL",
+        "NULL, 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}, nullValues = "NULL")
+    void rowsKeepTheIdsOfTheRequestThatCreatedThePayment(String requestId, String traceparent) {
+        PaymentEntity payment = payment(PaymentStatus.CAPTURED, null);
+        payment.setCorrelationRequestId(requestId);
+        payment.setTraceparent(traceparent);
+
+        try (Correlation.Scope ignored = Correlation.open("settling-req", "0af7651916cd43dd8448eb211c80319c")) {
+            outbox.enqueue(payment, 1);
+        }
+
+        ArgumentCaptor<PaymentOutboxEntity> saved = ArgumentCaptor.forClass(PaymentOutboxEntity.class);
+        verify(repository).save(saved.capture());
+        assertThat(saved.getValue().getCorrelationRequestId()).isEqualTo(requestId);
+        assertThat(saved.getValue().getTraceparent()).isEqualTo(traceparent);
+    }
+
+    @Test
+    void aPaymentWithoutIdsTakesThoseOfTheCurrentRequest() {
+        String currentTraceparent;
+        try (Correlation.Scope ignored = Correlation.open("current-req", "0af7651916cd43dd8448eb211c80319c")) {
+            currentTraceparent = Correlation.currentTraceparent();
+            outbox.enqueue(payment(PaymentStatus.CAPTURED, null), 1);
+        }
+
+        ArgumentCaptor<PaymentOutboxEntity> saved = ArgumentCaptor.forClass(PaymentOutboxEntity.class);
+        verify(repository).save(saved.capture());
+        assertThat(saved.getValue().getCorrelationRequestId()).isEqualTo("current-req");
+        assertThat(saved.getValue().getTraceparent()).isEqualTo(currentTraceparent);
     }
 
     @ParameterizedTest

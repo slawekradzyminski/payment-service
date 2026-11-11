@@ -92,3 +92,8 @@ springdoc:
 logging:
   level:
     root: INFO
+  # Human-readable lines carry [traceId,requestId] from the MDC. Servers set
+  # LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs instead: one JSON object per line with
+  # requestId, traceId and spanId as fields.
+  pattern:
+    correlation: "[%X{traceId:-},%X{requestId:-}] "
