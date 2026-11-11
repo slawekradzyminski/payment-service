@@ -1,6 +1,7 @@
 package com.awesome.payment.client;
 
 import com.awesome.payment.controller.exception.CustomException;
+import com.awesome.payment.correlation.CorrelationInterceptor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
@@ -11,7 +12,10 @@ import org.springframework.web.client.RestClientException;
 import java.util.List;
 import java.util.function.Supplier;
 
-/** {@link BackendClient} over HTTP with Spring's {@link RestClient}. */
+/**
+ * {@link BackendClient} over HTTP with Spring's {@link RestClient}. Every call carries the
+ * service token and the correlation headers ({@code X-Request-Id}, child {@code traceparent}).
+ */
 @Slf4j
 public class RestBackendClient implements BackendClient {
 
@@ -24,6 +28,7 @@ public class RestBackendClient implements BackendClient {
         RestClient.Builder configured = builder
                 .baseUrl(baseUrl)
                 .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
+                .requestInterceptor(new CorrelationInterceptor())
                 .defaultStatusHandler(HttpStatusCode::isError, (request, response) -> {
                     throw BackendErrorMapper.fromResponse(
                             response.getStatusCode(), StreamUtils.copyToByteArray(response.getBody()));

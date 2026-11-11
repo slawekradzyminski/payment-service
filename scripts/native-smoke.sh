@@ -7,7 +7,9 @@
 # publishes the JWKS at /internal/v1/jwks.json, answers GET /internal/v1/orders/{id}
 # with a PENDING order of "smoke-client", records POST /internal/v1/orders/{id}/payment
 # and serves GET /internal/v1/events: one card-refund.requested event for order 101
-# once the script publishes it (touch /tmp/publish-refund in the stub).
+# once the script publishes it (touch /tmp/publish-refund in the stub). The app logs ECS JSON
+# (LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs, as on the server), and the stub records the
+# X-Request-Id and traceparent of every call, so correlation ids are checked end to end.
 #   scripts/native-smoke.sh payment-service:native
 set -euo pipefail
 
@@ -18,6 +20,9 @@ RUN_ID="payment-smoke-$$"
 NETWORK="$RUN_ID"
 PORT="${SMOKE_PORT:-14004}"
 SERVICE_TOKEN="native-smoke-service-token"
+TRACE_ID="4bf92f3577b34da6a3ce929d0e0e4736"
+CALLER_SPAN="00f067aa0ba902b7"
+CANCEL_TRACE_ID="0af7651916cd43dd8448eb211c80319c"
 WEBHOOK_SECRET="native-smoke-webhook-secret"
 
 cleanup() {
@@ -55,6 +60,8 @@ read -r method path _
 length=0
 signature=""
 token=""
+request_id=""
+traceparent=""
 while IFS= read -r line; do
   line=$(printf '%s' "$line" | tr -d '\r')
   [ -z "$line" ] && break
@@ -62,6 +69,8 @@ while IFS= read -r line; do
     [Cc]ontent-[Ll]ength:*) length=${line#*: } ;;
     [Xx]-[Pp]ayment-[Ss]ignature:*) signature=${line#*: } ;;
     [Xx]-[Ss]ervice-[Tt]oken:*) token=${line#*: } ;;
+    [Xx]-[Rr]equest-[Ii]d:*) request_id=${line#*: } ;;
+    [Tt]raceparent:*) traceparent=${line#*: } ;;
   esac
 done
 body=""
@@ -76,7 +85,7 @@ case "$method $path" in
     printf 'FEED %s|%s\n' "$path" "$token" >> /tmp/requests.log
     after=$(printf '%s' "$path" | sed -n 's/.*[?&]after=\([0-9]*\).*/\1/p')
     if [ "${after:-0}" = 0 ] && [ -f /tmp/publish-refund ]; then
-      response='{"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1","type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":101,"username":"smoke-client","data":{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"}}],"nextCursor":1,"hasMore":false}'
+      response='{"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1","type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":101,"username":"smoke-client","data":{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"},"requestId":"smoke-cancel-1","traceId":"0af7651916cd43dd8448eb211c80319c"}],"nextCursor":1,"hasMore":false}'
     else
       response=$(printf '{"events":[],"nextCursor":%s,"hasMore":false}' "${after:-0}")
     fi ;;
@@ -88,6 +97,7 @@ case "$method $path" in
   *) status="404 Not Found"; response='{"message":"Not found"}' ;;
 esac
 printf '%s %s\n' "$method" "$path" >> /tmp/requests.log
+printf 'CORR %s %s|%s|%s\n' "$method" "$path" "$request_id" "$traceparent" >> /tmp/requests.log
 printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' \
   "$status" "${#response}" "$response"
 STUB
@@ -144,7 +154,7 @@ docker run -d --name "$RUN_ID-app" --network "$NETWORK" --memory 160m -p "$PORT:
   -e SPRING_DATASOURCE_USERNAME=payment -e SPRING_DATASOURCE_PASSWORD=payment \
   -e PAYMENT_SERVICE_TOKEN="$SERVICE_TOKEN" -e PAYMENT_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
   -e PAYMENT_SETTLEMENT_DELAY=PT2S -e PAYMENT_SETTLEMENT_INTERVAL=PT1S -e PAYMENT_EVENTS_POLL_INTERVAL=PT1S \
-  -e BACKEND_BASE_URL="http://$RUN_ID-backend:4001" \
+  -e BACKEND_BASE_URL="http://$RUN_ID-backend:4001" -e LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs \
   "$IMAGE" >/dev/null
 
 base="http://localhost:$PORT"
@@ -167,15 +177,22 @@ curl -sf -H 'Host: awesome.byst.re' -H 'X-Forwarded-Host: awesome.byst.re' -H 'X
 CLIENT=$(token smoke-client ROLE_CLIENT)
 ADMIN=$(token smoke-admin ROLE_ADMIN)
 card() { printf '{"orderId":%s,"card":{"number":"%s","expiryMonth":12,"expiryYear":2035,"cvc":"987","holderName":"Smoke Test"}}' "$1" "$2"; }
-pay() { curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $CLIENT" -H 'Content-Type: application/json' \
-  -H "Idempotency-Key: $1" -d "$2" -D "$WORK/headers" "$base/api/v1/payments"; }
+pay() { local key=$1 body=$2; shift 2
+  curl -s -w '\n%{http_code}' -X POST -H "Authorization: Bearer $CLIENT" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $key" "$@" -d "$body" -D "$WORK/headers" "$base/api/v1/payments"; }
+corr_of() { docker exec "$RUN_ID-backend" grep "^CORR $1|" /tmp/requests.log 2>/dev/null | head -n1 || true; }
+wait_corr() { local found=""; for _ in $(seq 1 20); do found=$(corr_of "$1"); [[ -n "$found" ]] && break; sleep 0.5; done
+  printf '%s' "$found"; }
 
 expect "missing token" "$(status_of "$base/api/v1/admin/payments")" 401
 expect "client role forbidden on admin list" "$(status_of -H "Authorization: Bearer $CLIENT" "$base/api/v1/admin/payments")" 403
 expect "tampered token" "$(status_of -H "Authorization: Bearer ${ADMIN}x" "$base/api/v1/admin/payments")" 401
 expect "HMAC token signed with the public modulus" "$(status_of -H "Authorization: Bearer $(hmac_token)" "$base/api/v1/admin/payments")" 401
 
-created=$(pay smoke-key-0001 "$(card 101 '4242 4242 4242 4242')")
+created=$(pay smoke-key-0001 "$(card 101 '4242 4242 4242 4242')" -H 'X-Request-Id: smoke-req-1' \
+  -H "traceparent: 00-$TRACE_ID-$CALLER_SPAN-01")
+grep -qi '^X-Request-Id: smoke-req-1' "$WORK/headers" && echo "PASS X-Request-Id answered" \
+  || { echo "FAIL X-Request-Id not answered" >&2; exit 1; }
 expect "visa payment created" "$(tail -n1 <<< "$created")" 201
 contains "visa payment captured" "$created" '"status":"CAPTURED"'
 contains "only brand and last4 returned" "$created" '"cardBrand":"VISA","cardLast4":"4242"'
@@ -200,6 +217,14 @@ t=${result_signature#t=}; t=${t%%,*}
 expected=$(printf '%s.%s' "$t" "$result_body" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $NF}')
 expect "result notification signature" "$result_signature" "t=$t,v1=$expected"
 contains "result notification body" "$result_body" "\"paymentId\":\"$payment_id\",\"status\":\"CAPTURED\",\"amount\":42.50"
+IFS='|' read -r _ corr_request corr_traceparent <<< "$(wait_corr 'POST /internal/v1/orders/101/payment')"
+expect "result notification carries the X-Request-Id" "$corr_request" "smoke-req-1"
+contains "result notification carries a child traceparent" "$corr_traceparent" "^00-$TRACE_ID-[0-9a-f]\{16\}-01$"
+if [[ "$corr_traceparent" == *"$CALLER_SPAN"* ]]; then echo "FAIL child traceparent reuses the caller's span" >&2; exit 1; fi
+invalid=$(pay smoke-key-0005 "$(card 105 '4242 4242 4242 4241')" -H 'X-Request-Id: bad id;x')
+expect "rejected card with an invalid X-Request-Id" "$(tail -n1 <<< "$invalid")" 400
+generated=$(sed -n 's/^[Xx]-[Rr]equest-[Ii]d: \([^[:space:]]*\).*/\1/p' "$WORK/headers")
+contains "invalid X-Request-Id is replaced" "$generated" '^[0-9a-f-]\{36\}$'
 
 challenged=$(pay smoke-key-0003 "$(card 103 '4000 0000 0000 3220')")
 contains "3-D Secure challenge" "$challenged" '"type":"THREE_DS_CHALLENGE"'
@@ -208,7 +233,8 @@ answered=$(curl -sf -X POST -H "Authorization: Bearer $CLIENT" -H 'Content-Type:
   "$base/api/v1/payments/$challenge_id/3ds")
 contains "3-D Secure captured" "$answered" '"status":"CAPTURED"'
 
-processing=$(pay smoke-key-0004 "$(card 104 '4000 0000 0000 0077')")
+processing=$(pay smoke-key-0004 "$(card 104 '4000 0000 0000 0077')" -H 'X-Request-Id: smoke-async-1' \
+  -H "traceparent: 00-$TRACE_ID-$CALLER_SPAN-01")
 contains "processing card" "$processing" '"status":"PROCESSING"'
 processing_id=$(field id "$(head -n1 <<< "$processing")")
 settled=""
@@ -218,6 +244,9 @@ for _ in $(seq 1 20); do
   sleep 0.5
 done
 contains "scheduled settlement" "$settled" '"status":"CAPTURED"'
+IFS='|' read -r _ corr_request corr_traceparent <<< "$(wait_corr 'POST /internal/v1/orders/104/payment')"
+expect "settled notification carries the creating request's X-Request-Id" "$corr_request" "smoke-async-1"
+contains "settled notification continues the creating request's trace" "$corr_traceparent" "^00-$TRACE_ID-"
 
 listed=$(curl -sf -H "Authorization: Bearer $ADMIN" "$base/api/v1/admin/payments?status=CAPTURED")
 contains "admin list" "$listed" '"totalElements":3'
@@ -250,11 +279,26 @@ expect "other users' payments are not found" "$(status_of -H "Authorization: Bea
 expect "other users' orders are not found" "$(status_of -H "Authorization: Bearer $(token smoke-other ROLE_CLIENT)" \
   "$base/api/v1/orders/101/payments")" 404
 
-if docker logs "$RUN_ID-app" 2>&1 | grep -E -q '4242424242424242|4242 4242 4242 4242|4000000000003220'; then
+app_log=$(docker logs "$RUN_ID-app" 2>&1)
+payment_line=$(grep -m1 "\"message\":\"Payment $payment_id for order 101" <<< "$app_log" || true)
+contains "JSON log line has the request id" "$payment_line" '"requestId":"smoke-req-1"'
+contains "JSON log line has the trace id" "$payment_line" "\"traceId\":\"$TRACE_ID\""
+contains "JSON log line has a span id" "$payment_line" '"spanId":"[0-9a-f]\{16\}"'
+refund_line=$(grep -m1 '"message":"Refunded 12.50 of payment' <<< "$app_log" || true)
+contains "card refund logs the cancel request's trace id" "$refund_line" "\"traceId\":\"$CANCEL_TRACE_ID\""
+contains "card refund logs the cancel request's id" "$refund_line" '"requestId":"smoke-cancel-1"'
+echo "JSON log line: $payment_line"
+if grep -v '^{' <<< "$app_log" | grep -q .; then
+  echo "FAIL non-JSON log lines with LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs:" >&2
+  grep -v '^{' <<< "$app_log" | head -n5 >&2
+  exit 1
+fi
+echo "PASS every log line is JSON"
+if grep -E -q '4242424242424242|4242 4242 4242 4242|4000000000003220|4000000000000077|"987"' <<< "$app_log"; then
   echo "FAIL a card number reached the log" >&2
   exit 1
 fi
-echo "PASS no card numbers in the log"
+echo "PASS no card numbers or CVC in the log"
 
 docker stats --no-stream --format 'memory: {{.MemUsage}}' "$RUN_ID-app"
 echo "native smoke test passed"

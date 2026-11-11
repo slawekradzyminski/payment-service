@@ -4,6 +4,7 @@ import com.awesome.payment.client.BackendClient;
 import com.awesome.payment.client.BackendException;
 import com.awesome.payment.client.EventFeedPage;
 import com.awesome.payment.client.FeedEvent;
+import com.awesome.payment.correlation.Correlation;
 import com.awesome.payment.entity.EventCursorEntity;
 import com.awesome.payment.entity.ProcessedEventEntity;
 import com.awesome.payment.repository.EventCursorRepository;
@@ -32,7 +33,9 @@ import java.util.stream.Collectors;
  * unavailable (or a transient database failure) stops the poll without moving the cursor; the next
  * tick retries. Any other handler failure is logged with the event id and the event is skipped,
  * so one bad event never blocks the feed. Scheduled every {@code payment.events.poll-interval},
- * switched off with {@code payment.events.enabled}.
+ * switched off with {@code payment.events.enabled}. While an event is handled, the MDC holds the
+ * event's {@code requestId} and {@code traceId} (when valid), so the card refund of a cancellation
+ * logs, and is stored, with the trace of the backend request that cancelled the order.
  */
 @Slf4j
 @Component
@@ -112,6 +115,13 @@ public class EventFeedPoller {
 
     /** Handles one event; false when it must be retried later (transient failure). */
     private boolean process(FeedEvent event) {
+        try (Correlation.Scope ignored = Correlation.open(Correlation.validRequestId(event.requestId()),
+                Correlation.validTraceId(event.traceId()))) {
+            return handle(event);
+        }
+    }
+
+    private boolean handle(FeedEvent event) {
         try {
             transaction.executeWithoutResult(status -> {
                 EventCursorEntity cursor = lockedCursor();

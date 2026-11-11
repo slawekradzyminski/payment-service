@@ -9,6 +9,7 @@ import com.awesome.payment.client.InternalOrderDto;
 import com.awesome.payment.client.JwkSet;
 import com.awesome.payment.client.OrderStatus;
 import com.awesome.payment.client.PaymentResultResponse;
+import com.awesome.payment.correlation.Correlation;
 import org.springframework.http.HttpStatus;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -36,6 +37,8 @@ import java.util.regex.Pattern;
  * is not payable") and the domain event feed ({@code GET /internal/v1/events}: sequence order,
  * {@code after}/{@code limit}/{@code types}, {@code nextCursor}/{@code hasMore}), so flow tests
  * run without Docker or HTTP. The signature is verified with an independent HMAC implementation.
+ * Each call records the correlation the real {@code RestBackendClient} would send
+ * ({@code X-Request-Id} and the trace id of the child {@code traceparent}), read from the MDC.
  */
 public class FakeBackend implements BackendClient {
 
@@ -56,9 +59,12 @@ public class FakeBackend implements BackendClient {
     private volatile boolean available = true;
     private volatile long orderLookupDelayMillis;
 
-    /** One received result notification, as the backend would see it on the wire. */
+    /**
+     * One received result notification, as the backend would see it on the wire; {@code requestId}
+     * and {@code traceId} are the correlation the call was made under (null outside any context).
+     */
     public record Delivery(long orderId, String rawBody, String signature, long timestamp, boolean signatureValid,
-                           JsonNode body) {
+                           JsonNode body, String requestId, String traceId) {
     }
 
     /** One {@code GET /internal/v1/events} call as the backend would see its query parameters. */
@@ -161,7 +167,7 @@ public class FakeBackend implements BackendClient {
                 && Math.abs(clock.instant().getEpochSecond() - Long.parseLong(matcher.group(1))) <= 300;
         JsonNode body = JSON.readTree(rawBody);
         deliveries.add(new Delivery(orderId, rawBody, signature, matcher.matches() ? Long.parseLong(matcher.group(1)) : -1,
-                valid, body));
+                valid, body, Correlation.currentRequestId(), Correlation.currentTraceId()));
         if (!valid) {
             throw BackendErrorMapper.fromResponse(HttpStatus.UNAUTHORIZED, null);
         }
@@ -195,8 +201,14 @@ public class FakeBackend implements BackendClient {
     }
 
     public FeedEvent publish(UUID eventId, String type, Long orderId, Map<String, Object> data) {
+        return publish(eventId, type, orderId, data, null, null);
+    }
+
+    /** Appends an event written by a request with these correlation ids (as the backend's V17 feed does). */
+    public FeedEvent publish(UUID eventId, String type, Long orderId, Map<String, Object> data, String requestId,
+                             String traceId) {
         FeedEvent event = new FeedEvent(sequences.incrementAndGet(), eventId, type, clock.instant().toString(), orderId,
-                "client", JSON.valueToTree(data));
+                "client", JSON.valueToTree(data), requestId, traceId);
         feed.add(event);
         return event;
     }
@@ -204,7 +216,7 @@ public class FakeBackend implements BackendClient {
     /** Re-appends an already published event (same id) under a new sequence, like a redelivery. */
     public FeedEvent republish(FeedEvent event) {
         FeedEvent copy = new FeedEvent(sequences.incrementAndGet(), event.id(), event.type(), event.occurredAt(),
-                event.orderId(), event.username(), event.data());
+                event.orderId(), event.username(), event.data(), event.requestId(), event.traceId());
         feed.add(copy);
         return copy;
     }

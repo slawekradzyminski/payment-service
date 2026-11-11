@@ -49,6 +49,23 @@ class OpenApiDocumentationTest extends AbstractFlowTest {
     }
 
     @Test
+    void everyResponseDocumentsTheRequestIdHeader() {
+        JsonNode root = jsonMapper.readTree(getJson("/v3/api-docs", null).body());
+
+        assertThat(root.at("/components/headers/X-Request-Id/schema/maxLength").asInt()).isEqualTo(128);
+        List<String> missing = new ArrayList<>();
+        root.get("paths").properties().forEach(path -> path.getValue().properties().forEach(operation ->
+                operation.getValue().get("responses").properties().forEach(response -> {
+                    if (!"#/components/headers/X-Request-Id".equals(
+                            response.getValue().at("/headers/X-Request-Id/$ref").asString())) {
+                        missing.add(path.getKey() + " " + operation.getKey() + " " + response.getKey());
+                    }
+                })));
+        assertThat(missing).isEmpty();
+        assertThat(root.at("/paths/~1api~1v1~1payments/post/responses").size()).isGreaterThan(5);
+    }
+
+    @Test
     void healthAndPrometheusArePublicButOtherActuatorEndpointsAreNot() {
         assertThat(getJson("/actuator/health", null).status()).isEqualTo(200);
         assertThat(getJson("/actuator/prometheus", null).status()).isEqualTo(200);

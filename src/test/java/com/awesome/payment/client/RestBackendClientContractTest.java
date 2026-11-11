@@ -1,7 +1,10 @@
 package com.awesome.payment.client;
 
+import com.awesome.payment.correlation.Correlation;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.slf4j.MDC;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -9,11 +12,13 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.content;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.headerDoesNotExist;
@@ -39,6 +44,10 @@ class RestBackendClientContractTest {
             + "\"paymentId\":\"00000000-0000-0000-0000-000000000002\",\"status\":\"CAPTURED\",\"amount\":126.00,"
             + "\"currency\":\"USD\",\"failureCode\":null}";
 
+    private static final String TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+    private static final String UUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+    private static final String TRACEPARENT_PATTERN = "^00-[0-9a-f]{32}-[0-9a-f]{16}-01$";
+
     private MockRestServiceServer server;
     private RestBackendClient client;
 
@@ -47,6 +56,11 @@ class RestBackendClientContractTest {
         RestClient.Builder builder = RestClient.builder();
         server = MockRestServiceServer.bindTo(builder).build();
         client = new RestBackendClient(builder, BASE, TOKEN);
+    }
+
+    @AfterEach
+    void clearCorrelation() {
+        MDC.clear();
     }
 
     @Test
@@ -84,10 +98,15 @@ class RestBackendClientContractTest {
                 .andExpect(header("X-Service-Token", TOKEN))
                 .andExpect(header("X-Payment-Signature", "t=1,v1=abc"))
                 .andExpect(header("Content-Type", MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(header("X-Request-Id", "req-42"))
+                .andExpect(header("traceparent", matchesPattern("^00-" + TRACE_ID + "-[0-9a-f]{16}-01$")))
                 .andExpect(content().string(RESULT_BODY))
                 .andRespond(withSuccess("{\"orderId\":42,\"orderStatus\":\"PAID\"}", MediaType.APPLICATION_JSON));
 
-        PaymentResultResponse response = client.sendPaymentResult(42, RESULT_BODY, "t=1,v1=abc");
+        PaymentResultResponse response;
+        try (Correlation.Scope ignored = Correlation.open("req-42", TRACE_ID)) {
+            response = client.sendPaymentResult(42, RESULT_BODY, "t=1,v1=abc");
+        }
 
         server.verify();
         assertThat(response).isEqualTo(new PaymentResultResponse(42L, OrderStatus.PAID));
@@ -121,7 +140,8 @@ class RestBackendClientContractTest {
                         {"events":[{"sequence":42,"id":"00000000-0000-0000-0000-0000000000e1",
                           "type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":7,
                           "username":"client","data":{"requestId":"00000000-0000-0000-0000-00000000a001",
-                          "orderId":7,"amount":12.50,"reason":"Return #1"},"unknown":true}],
+                          "orderId":7,"amount":12.50,"reason":"Return #1"},"requestId":"gw-req-1",
+                          "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","unknown":true}],
                          "nextCursor":45,"hasMore":true}""", MediaType.APPLICATION_JSON));
 
         EventFeedPage page = client.events(41, 100, List.of("card-refund.requested", "order.cancelled"));
@@ -138,7 +158,65 @@ class RestBackendClientContractTest {
             assertThat(event.username()).isEqualTo("client");
             assertThat(event.data().get("amount").decimalValue()).isEqualByComparingTo("12.50");
             assertThat(event.data().get("requestId").asString()).isEqualTo("00000000-0000-0000-0000-00000000a001");
+            assertThat(event.requestId()).isEqualTo("gw-req-1");
+            assertThat(event.traceId()).isEqualTo(TRACE_ID);
         });
+    }
+
+    @Test
+    void feedEventsWithoutCorrelationIdsAreStillRead() {
+        server.expect(requestTo(BASE + "/internal/v1/events?after=0&limit=100&types=card-refund.requested"))
+                .andRespond(withSuccess("""
+                        {"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1",
+                          "type":"card-refund.requested","orderId":7,"data":{}}],"nextCursor":1,"hasMore":false}""",
+                        MediaType.APPLICATION_JSON));
+
+        assertThat(client.events(0, 100, List.of("card-refund.requested")).events()).singleElement()
+                .satisfies(event -> {
+                    assertThat(event.requestId()).isNull();
+                    assertThat(event.traceId()).isNull();
+                });
+    }
+
+    @Test
+    void everyCallCarriesTheCurrentRequestIdAndANewChildSpanOfTheCurrentTrace() {
+        List<String> traceparents = new ArrayList<>();
+        String expectedTraceparent = "^00-" + TRACE_ID + "-[0-9a-f]{16}-01$";
+        server.expect(requestTo(BASE + "/internal/v1/orders/42"))
+                .andExpect(header("X-Request-Id", "gw.req_42-A"))
+                .andExpect(header("traceparent", matchesPattern(expectedTraceparent)))
+                .andExpect(request -> traceparents.add(request.getHeaders().getFirst("traceparent")))
+                .andRespond(withSuccess(ORDER_JSON, MediaType.APPLICATION_JSON));
+        server.expect(requestTo(BASE + "/internal/v1/events?after=0&limit=100&types=card-refund.requested"))
+                .andExpect(header("X-Request-Id", "gw.req_42-A"))
+                .andExpect(header("traceparent", matchesPattern(expectedTraceparent)))
+                .andExpect(request -> traceparents.add(request.getHeaders().getFirst("traceparent")))
+                .andRespond(withSuccess("{\"events\":[],\"nextCursor\":0,\"hasMore\":false}",
+                        MediaType.APPLICATION_JSON));
+
+        String ownSpan;
+        try (Correlation.Scope ignored = Correlation.open("gw.req_42-A", TRACE_ID)) {
+            ownSpan = MDC.get(Correlation.SPAN_ID);
+            client.getOrder(42);
+            client.events(0, 100, List.of("card-refund.requested"));
+        }
+
+        server.verify();
+        assertThat(traceparents).hasSize(2).doesNotHaveDuplicates()
+                .noneMatch(traceparent -> traceparent.contains(ownSpan));
+    }
+
+    @Test
+    void aCallOutsideAnyRequestStartsAFreshRequestIdAndTrace() {
+        server.expect(requestTo(BASE + "/internal/v1/jwks.json"))
+                .andExpect(header("X-Request-Id", matchesPattern(UUID_PATTERN)))
+                .andExpect(header("traceparent", matchesPattern(TRACEPARENT_PATTERN)))
+                .andRespond(withSuccess("{\"keys\":[]}", MediaType.APPLICATION_JSON));
+
+        client.jwks();
+
+        server.verify();
+        assertThat(MDC.getCopyOfContextMap()).isNullOrEmpty();
     }
 
     @Test
