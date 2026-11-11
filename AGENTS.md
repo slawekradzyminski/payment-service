@@ -7,16 +7,24 @@ documentation, code comments, test names, commit messages and handoff notes.
 
 ## Contract
 
-- The service boundary is the "Payments" section of the commerce-wave contract
-  (`CONTRACTS.md`, to be published as `awesome-localstack/docs/PAYMENT_SERVICE_CONTRACT.md`).
+- The service boundary is the "Payments" and "Event feed" sections of the commerce-wave
+  contract (`CONTRACTS.md`, to be published as `awesome-localstack/docs/PAYMENT_SERVICE_CONTRACT.md`).
   Implement exactly that boundary: public API, `PaymentDto`, statuses, test cards,
-  idempotency, the signed result notification and the refund endpoint.
+  idempotency, the signed result notification and card refunds from the backend event
+  feed (`card-refund.requested`). The backend never calls payment-service; there is
+  no inbound internal API.
 - Order data always comes from the backend internal API through `BackendClient`;
   never add a local order table. A payment keeps only the order id and owner snapshot.
 - Card data: only brand and last four digits are stored. Never log, persist or
   echo a card number or CVC (`CardDataLeakTest` checks logs and every table).
-- `RestBackendClientContractTest` pins the internal-API requests (path, headers,
-  verbatim signed body). Change it only together with the contract and the backend.
+- `RestBackendClientContractTest` pins the internal-API requests (path, query,
+  headers, verbatim signed body), including `GET /internal/v1/events`. Change it only
+  together with the contract and the backend.
+- Event feed handling: one local transaction per event (handle, record in
+  `processed_events`, advance `event_cursors`); handlers implement `FeedEventHandler`,
+  must be idempotent and must not throw for expected business outcomes (that would
+  skip the event). Transient failures leave the cursor; others skip the event.
+- Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
 
 # Verification Commands
@@ -31,8 +39,10 @@ documentation, code comments, test names, commit messages and handoff notes.
 
 The default test run needs neither Docker nor a backend: flow tests use the
 in-memory `FakeBackend`, which implements the contract's result-notification rules
-(signature check, idempotency per requestId, amountDue check, 409 "Order is not payable"),
-and a `MutableClock` that drives settlement delays, outbox backoff and card expiry.
+(signature check, idempotency per requestId, amountDue check, 409 "Order is not payable")
+and serves an in-memory event feed, and a `MutableClock` that drives settlement delays,
+outbox backoff and card expiry. The event feed poller is disabled in tests and called
+explicitly (`EventFeedPoller.poll()`).
 
 # Native-image rules
 
@@ -41,7 +51,7 @@ and a `MutableClock` that drives settlement delays, outbox backoff and card expi
 - No runtime classpath scanning, no reflection without hints, no bean
   conditions (`@Profile`, `@ConditionalOn*`) that must change per deployment
   (Spring AOT fixes them at build time; use runtime properties such as
-  `payment.settlement.enabled` instead).
+  `payment.settlement.enabled` or `payment.events.enabled` instead).
 - Add Jackson binding hints in `NativeRuntimeHints` for every new type sent
   to or read from the backend.
 - After changing dependencies, hints or configuration, rebuild the image and
@@ -52,15 +62,17 @@ and a `MutableClock` that drives settlement delays, outbox backoff and card expi
 - PITest: run the profile above after normal verification when you change the
   card checks or provider, the payment state machine, the signature, the result
   outbox or dispatcher, settlement and 3-D Secure expiry, refunds, the per-order
-  payment lock or the service-token filter. Narrow it
+  payment lock or the event feed poller and its handlers. Narrow it
   for small changes, for example
   `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage -DtargetClasses=com.awesome.payment.service.PaymentStateMachine -DtargetTests=com.awesome.payment.service.PaymentStateMachineTest`.
 - Treat `NO_COVERAGE` as a reachability gap and `SURVIVED` as an assertion gap.
   For each meaningful survivor add a test that passes on the original and fails
   on the mutant. Known equivalent mutants: the Luhn `digit > 9` boundary (a
   doubled digit is never 9), `sum +=` to `-=` (a multiple of 10 either way), the
-  backoff cap and error-truncation boundaries, and the dispatcher's log-only
-  "will retry"/"giving up" ternary. Keep the run advisory; do not use the
+  backoff cap and error-truncation boundaries, the dispatcher's log-only
+  "will retry"/"giving up" ternary, the poller's REQUIRES_NEW propagation (there is
+  never an outer transaction) and cursor `>` boundary (re-saving the same value), and
+  the refund reason truncation boundary (substring of the full length). Keep the run advisory; do not use the
   aggregate score as a gate.
 
 # Change discipline
@@ -68,8 +80,7 @@ and a `MutableClock` that drives settlement delays, outbox backoff and card expi
 - Preserve unrelated working-tree changes.
 - Keep README.md (run, env vars, profiles) in sync with `application*.yml`.
 - Every controller endpoint needs `@Operation` (summary and description) and
-  `@ApiResponse` entries; `OpenApiDocumentationTest` enforces it. The internal
-  refund endpoint is `@Hidden` and excluded from `/v3/api-docs`.
+  `@ApiResponse` entries; `OpenApiDocumentationTest` enforces it.
 
 # Native smoke test
 
@@ -77,6 +88,7 @@ and a `MutableClock` that drives settlement delays, outbox backoff and card expi
   boots the native binary against a real Postgres (under a 160 MiB limit) with a
   busybox `nc` backend stub (JWKS, order snapshots, result sink) and checks
   migrations, JWT validation, card payments, idempotent replay, 3-D Secure,
-  scheduled settlement, the signed result notification, refunds, health, metrics,
-  OpenAPI and that no card number reaches the log. CI runs it on every push and
+  scheduled settlement, the signed result notification, a card refund read from the
+  stub's event feed (types filter, cursor), 404 for other users' payments and orders,
+  health, metrics, OpenAPI and that no card number reaches the log. CI runs it on every push and
   pull request.

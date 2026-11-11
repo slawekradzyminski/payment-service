@@ -9,6 +9,8 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -106,6 +108,58 @@ class RestBackendClientContractTest {
                         + "\"n\":\"AQAB\",\"e\":\"AQAB\"}]}", MediaType.APPLICATION_JSON));
 
         assertThat(client.jwks().keys()).singleElement().satisfies(key -> assertThat(key.kid()).isEqualTo("k1"));
+    }
+
+    @Test
+    void theEventFeedIsReadFromTheCursorWithTheTypesFilter() {
+        server.expect(requestTo(BASE + "/internal/v1/events?after=41&limit=100&types=card-refund.requested,order.cancelled"))
+                .andExpect(method(HttpMethod.GET))
+                .andExpect(header("X-Service-Token", TOKEN))
+                .andExpect(header("Accept", MediaType.APPLICATION_JSON_VALUE))
+                .andExpect(headerDoesNotExist("Authorization"))
+                .andRespond(withSuccess("""
+                        {"events":[{"sequence":42,"id":"00000000-0000-0000-0000-0000000000e1",
+                          "type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":7,
+                          "username":"client","data":{"requestId":"00000000-0000-0000-0000-00000000a001",
+                          "orderId":7,"amount":12.50,"reason":"Return #1"},"unknown":true}],
+                         "nextCursor":45,"hasMore":true}""", MediaType.APPLICATION_JSON));
+
+        EventFeedPage page = client.events(41, 100, List.of("card-refund.requested", "order.cancelled"));
+
+        server.verify();
+        assertThat(page.nextCursor()).isEqualTo(45L);
+        assertThat(page.hasMore()).isTrue();
+        assertThat(page.events()).singleElement().satisfies(event -> {
+            assertThat(event.sequence()).isEqualTo(42L);
+            assertThat(event.id()).isEqualTo(UUID.fromString("00000000-0000-0000-0000-0000000000e1"));
+            assertThat(event.type()).isEqualTo("card-refund.requested");
+            assertThat(event.occurredAt()).isEqualTo("2026-11-10T12:00:00Z");
+            assertThat(event.orderId()).isEqualTo(7L);
+            assertThat(event.username()).isEqualTo("client");
+            assertThat(event.data().get("amount").decimalValue()).isEqualByComparingTo("12.50");
+            assertThat(event.data().get("requestId").asString()).isEqualTo("00000000-0000-0000-0000-00000000a001");
+        });
+    }
+
+    @Test
+    void anEmptyFeedPageHasNoEvents() {
+        server.expect(requestTo(BASE + "/internal/v1/events?after=0&limit=100&types=card-refund.requested"))
+                .andRespond(withSuccess("{\"events\":[],\"nextCursor\":0,\"hasMore\":false}", MediaType.APPLICATION_JSON));
+
+        EventFeedPage page = client.events(0, 100, List.of("card-refund.requested"));
+
+        assertThat(page.events()).isEmpty();
+        assertThat(page.hasMore()).isFalse();
+        assertThat(new EventFeedPage(null, 0, false).events()).isEmpty();
+    }
+
+    @Test
+    void anUnavailableFeedIsTransient() {
+        server.expect(requestTo(BASE + "/internal/v1/events?after=0&limit=100&types=card-refund.requested"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+
+        assertThatThrownBy(() -> client.events(0, 100, List.of("card-refund.requested")))
+                .isInstanceOfSatisfying(BackendException.class, e -> assertThat(e.isTransient()).isTrue());
     }
 
     @Test

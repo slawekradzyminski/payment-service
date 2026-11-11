@@ -8,6 +8,7 @@ import org.springframework.util.StreamUtils;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
+import java.util.List;
 import java.util.function.Supplier;
 
 /** {@link BackendClient} over HTTP with Spring's {@link RestClient}. */
@@ -63,6 +64,18 @@ public class RestBackendClient implements BackendClient {
                 .uri("/internal/v1/jwks.json")
                 .retrieve()
                 .body(JwkSet.class));
+    }
+
+    @Override
+    public EventFeedPage events(long after, int limit, List<String> types) {
+        return required(() -> restClient.get()
+                .uri(uri -> uri.path("/internal/v1/events")
+                        .queryParam("after", after)
+                        .queryParam("limit", limit)
+                        .queryParam("types", String.join(",", types))
+                        .build())
+                .retrieve()
+                .body(EventFeedPage.class));
     }
 
     private static <T> T required(Supplier<T> request) {

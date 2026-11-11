@@ -15,3 +15,5 @@ payment:
     enabled: false
   notifications:
     retry-enabled: false
+  events:
+    enabled: false

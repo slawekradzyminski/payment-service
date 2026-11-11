@@ -47,8 +47,8 @@ backend:
   read-timeout: 10s
 
 payment:
-  # X-Service-Token for both directions: payment-service -> backend internal API and
-  # backend -> /internal/v1/payments/refunds. Blank disables the refund endpoint (404).
+  # X-Service-Token sent on every call to the backend internal API (orders, payment
+  # results, JWKS, event feed). The backend never calls payment-service.
   service-token: ${PAYMENT_SERVICE_TOKEN:local-payment-token}
   # HMAC-SHA256 key for the X-Payment-Signature header of result notifications.
   webhook-secret: ${PAYMENT_WEBHOOK_SECRET:local-payment-webhook-secret}
@@ -63,6 +63,10 @@ payment:
   notifications:
     retry-enabled: ${PAYMENT_NOTIFICATIONS_RETRY_ENABLED:true}
     retry-interval: ${PAYMENT_NOTIFICATIONS_RETRY_INTERVAL:PT30S}
+  # Polls the backend event feed (GET /internal/v1/events) for card-refund.requested.
+  events:
+    enabled: ${PAYMENT_EVENTS_ENABLED:true}
+    poll-interval: ${PAYMENT_EVENTS_POLL_INTERVAL:PT5S}
 
 security:
   jwt:
@@ -84,8 +88,6 @@ management:
 springdoc:
   api-docs:
     path: /v3/api-docs
-  # The internal refund endpoint is service-to-service only.
-  paths-to-exclude: /internal/**
 
 logging:
   level:

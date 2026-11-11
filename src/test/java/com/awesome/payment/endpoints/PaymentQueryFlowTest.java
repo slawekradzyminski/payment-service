@@ -16,17 +16,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PaymentQueryFlowTest extends AbstractFlowTest {
 
     @Test
-    void ownerAndAdminSeeAPaymentOthersDoNot() {
+    void ownerAndAdminSeeAPaymentOthersGetNotFound() {
         PaymentDto payment = paid(VISA);
         String path = PAYMENTS + "/" + payment.id();
 
         assertThat(getJson(path, clientToken).as(PaymentDto.class)).isEqualTo(payment);
         assertThat(getJson(path, adminToken).status()).isEqualTo(200);
         Response other = getJson(path, otherClientToken);
-        assertThat(other.status()).isEqualTo(403);
-        assertThat(other.message()).isEqualTo("Access denied");
+        Response missing = getJson(PAYMENTS + "/" + UUID.randomUUID(), clientToken);
+        assertThat(other.status()).isEqualTo(404);
+        assertThat(other.body()).isEqualTo(missing.body()).isEqualTo("{\"message\":\"Payment not found\"}");
+        assertThat(missing.status()).isEqualTo(404);
         assertThat(getJson(path, null).status()).isEqualTo(401);
-        assertThat(getJson(PAYMENTS + "/" + UUID.randomUUID(), clientToken).status()).isEqualTo(404);
         assertThat(getJson(PAYMENTS + "/123", clientToken).status()).isEqualTo(400);
     }
 
@@ -53,16 +54,22 @@ class PaymentQueryFlowTest extends AbstractFlowTest {
     @Test
     void orderPaymentsNeedAnExistingOwnOrder() {
         long orderId = backend.order("client", "10.00").id();
+        paid(VISA);
+        pay(orderId, VISA, clientToken);
 
-        assertThat(getJson("/api/v1/orders/" + orderId + "/payments", clientToken).body()).isEqualTo("[]");
+        assertThat(getJson("/api/v1/orders/" + orderId + "/payments", clientToken).status()).isEqualTo(200);
+        assertThat(getJson("/api/v1/orders/" + orderId + "/payments", adminToken).status()).isEqualTo(200);
+        // Another user's order is answered exactly like a missing one (as the backend does).
         Response other = getJson("/api/v1/orders/" + orderId + "/payments", otherClientToken);
-        assertThat(other.status()).isEqualTo(403);
-        assertThat(other.message()).isEqualTo("Access denied");
         Response unknown = getJson("/api/v1/orders/987654/payments", clientToken);
+        assertThat(other.status()).isEqualTo(404);
         assertThat(unknown.status()).isEqualTo(404);
-        assertThat(unknown.message()).isEqualTo("Order not found");
+        assertThat(other.body()).isEqualTo(unknown.body()).isEqualTo("{\"message\":\"Order not found\"}");
         backend.setAvailable(false);
         assertThat(getJson("/api/v1/orders/" + orderId + "/payments", clientToken).status()).isEqualTo(503);
+        backend.setAvailable(true);
+        assertThat(getJson("/api/v1/orders/" + backend.order("other", "1.00").id() + "/payments", clientToken).body())
+                .isEqualTo("{\"message\":\"Order not found\"}");
     }
 
     @Test

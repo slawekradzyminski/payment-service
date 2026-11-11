@@ -1,9 +1,12 @@
 package com.awesome.payment.support;
 
 import com.awesome.payment.dto.payment.PaymentDto;
+import com.awesome.payment.events.EventFeedPoller;
+import com.awesome.payment.repository.EventCursorRepository;
 import com.awesome.payment.repository.IdempotencyKeyRepository;
 import com.awesome.payment.repository.PaymentOutboxRepository;
 import com.awesome.payment.repository.PaymentRepository;
+import com.awesome.payment.repository.ProcessedEventRepository;
 import com.awesome.payment.repository.RefundRepository;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -35,8 +38,6 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 public abstract class AbstractFlowTest {
 
     protected static final String PAYMENTS = "/api/v1/payments";
-    protected static final String REFUNDS = "/internal/v1/payments/refunds";
-    protected static final String SERVICE_TOKEN = "test-service-token";
 
     protected static final String VISA = "4242 4242 4242 4242";
     protected static final String MASTERCARD = "5555 5555 5555 4444";
@@ -62,6 +63,9 @@ public abstract class AbstractFlowTest {
     @Autowired private IdempotencyKeyRepository idempotencyKeyRepository;
     @Autowired private RefundRepository refundRepository;
     @Autowired private com.awesome.payment.repository.OrderPaymentLockRepository orderPaymentLocks;
+    @Autowired protected EventFeedPoller poller;
+    @Autowired protected EventCursorRepository eventCursors;
+    @Autowired protected ProcessedEventRepository processedEvents;
 
     @BeforeEach
     void resetBackend() {
@@ -76,6 +80,8 @@ public abstract class AbstractFlowTest {
         idempotencyKeyRepository.deleteAll();
         paymentRepository.deleteAll();
         orderPaymentLocks.deleteAll();
+        processedEvents.deleteAll();
+        eventCursors.deleteAll();
     }
 
     protected static String newKey() {
@@ -116,14 +122,6 @@ public abstract class AbstractFlowTest {
 
     protected Response threeDs(UUID paymentId, String code, String token) {
         return postJson(PAYMENTS + "/" + paymentId + "/3ds", Map.of("code", code), token);
-    }
-
-    protected Response refund(Object body, String serviceToken) {
-        MockHttpServletRequestBuilder builder = withBody(post(REFUNDS), body);
-        if (serviceToken != null) {
-            builder.header("X-Service-Token", serviceToken);
-        }
-        return perform(builder, null);
     }
 
     protected Response getJson(String path, String token) {

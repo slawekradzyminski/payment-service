@@ -49,7 +49,8 @@ public class PaymentService {
     static final String NOT_PAYABLE = "Order is not payable";
     static final String NOT_YOUR_ORDER = "You can only pay for your own orders";
     static final String PAYMENT_NOT_FOUND = "Payment not found";
-    static final String ACCESS_DENIED = "Access denied";
+    /** The backend's wording: another user's order is answered exactly like a missing one. */
+    static final String ORDER_NOT_FOUND = "Order not found";
     static final String NO_ACTION_REQUIRED = "Payment does not require action";
 
     private final PaymentRepository paymentRepository;
@@ -166,12 +167,16 @@ public class PaymentService {
         return PaymentDto.from(loadVisible(principal, paymentId));
     }
 
-    /** The order's payments, newest first; the order must exist and belong to the caller (or caller is admin). */
+    /**
+     * The order's payments, newest first. The order must exist and belong to the caller (admins see
+     * any order); another user's order is 404 "Order not found", like a missing one, so its
+     * existence is not revealed (the backend answers the same).
+     */
     @Transactional(readOnly = true)
     public List<PaymentDto> forOrder(CustomPrincipal principal, long orderId) {
         InternalOrderDto order = backendClient.getOrder(orderId);
         if (!principal.isAdmin() && !principal.username().equals(order.username())) {
-            throw new CustomException(ACCESS_DENIED, HttpStatus.FORBIDDEN);
+            throw new CustomException(ORDER_NOT_FOUND, HttpStatus.NOT_FOUND);
         }
         return paymentRepository.findByOrderIdOrderByCreatedAtDescIdDesc(orderId).stream()
                 .map(PaymentDto::from).toList();
@@ -236,10 +241,11 @@ public class PaymentService {
         log.info("3-D Secure for payment {} expired", payment.getId());
     }
 
+    /** Another user's payment is 404 "Payment not found", like a missing one; admins see every payment. */
     private PaymentEntity loadVisible(CustomPrincipal principal, UUID paymentId) {
         PaymentEntity payment = load(paymentId);
         if (!principal.isAdmin() && !principal.username().equals(payment.getUsername())) {
-            throw new CustomException(ACCESS_DENIED, HttpStatus.FORBIDDEN);
+            throw new CustomException(PAYMENT_NOT_FOUND, HttpStatus.NOT_FOUND);
         }
         return payment;
     }

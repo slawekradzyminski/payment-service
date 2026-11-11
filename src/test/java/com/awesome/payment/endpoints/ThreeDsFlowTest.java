@@ -73,10 +73,12 @@ class ThreeDsFlowTest extends AbstractFlowTest {
     }
 
     @Test
-    void anotherUsersPaymentIsForbiddenButAdminMayAnswer() {
+    void anotherUsersPaymentIsNotFoundButAdminMayAnswer() {
         PaymentDto pending = paid(THREE_DS);
 
-        assertThat(threeDs(pending.id(), "123456", otherClientToken).status()).isEqualTo(403);
+        Response other = threeDs(pending.id(), "123456", otherClientToken);
+        assertThat(other.status()).isEqualTo(404);
+        assertThat(other.message()).isEqualTo("Payment not found");
         assertThat(threeDs(pending.id(), "123456", adminToken).status()).isEqualTo(200);
     }
 

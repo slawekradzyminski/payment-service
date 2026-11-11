@@ -2,10 +2,12 @@
 # Boots the payment-service image against a real Postgres and checks that the
 # native binary migrates the schema, validates backend-style RS256 JWTs against
 # a JWKS, takes card payments (JPA writes, outbox, signed result notification,
-# scheduled settlement), books internal refunds and serves health, metrics and
-# OpenAPI. Instead of a backend, a busybox nc stub publishes the JWKS at
-# /internal/v1/jwks.json, answers GET /internal/v1/orders/{id} with a PENDING
-# order of "smoke-client" and records POST /internal/v1/orders/{id}/payment.
+# scheduled settlement), books card refunds from the backend event feed and
+# serves health, metrics and OpenAPI. Instead of a backend, a busybox nc stub
+# publishes the JWKS at /internal/v1/jwks.json, answers GET /internal/v1/orders/{id}
+# with a PENDING order of "smoke-client", records POST /internal/v1/orders/{id}/payment
+# and serves GET /internal/v1/events: one card-refund.requested event for order 101
+# once the script publishes it (touch /tmp/publish-refund in the stub).
 #   scripts/native-smoke.sh payment-service:native
 set -euo pipefail
 
@@ -46,7 +48,7 @@ mkdir -p "$WORK/srv"
 printf '{"keys":[{"kty":"RSA","use":"sig","alg":"RS256","kid":"%s","n":"%s","e":"%s"}]}' \
   "$KID" "$MODULUS" "$EXPONENT" > "$WORK/srv/jwks.json"
 
-# One HTTP exchange per connection (nc -lk -e): JWKS, order snapshots and payment results.
+# One HTTP exchange per connection (nc -lk -e): JWKS, order snapshots, payment results and the event feed.
 cat > "$WORK/srv/backend.sh" <<'STUB'
 #!/bin/sh
 read -r method path _
@@ -70,6 +72,14 @@ case "$method $path" in
   "GET /internal/v1/orders/"*)
     id=${path##*/}
     response=$(printf '{"id":%s,"username":"smoke-client","status":"PENDING","totalAmount":42.50,"amountDue":42.50,"items":[]}' "$id") ;;
+  "GET /internal/v1/events?"*)
+    printf 'FEED %s|%s\n' "$path" "$token" >> /tmp/requests.log
+    after=$(printf '%s' "$path" | sed -n 's/.*[?&]after=\([0-9]*\).*/\1/p')
+    if [ "${after:-0}" = 0 ] && [ -f /tmp/publish-refund ]; then
+      response='{"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1","type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":101,"username":"smoke-client","data":{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"}}],"nextCursor":1,"hasMore":false}'
+    else
+      response=$(printf '{"events":[],"nextCursor":%s,"hasMore":false}' "${after:-0}")
+    fi ;;
   "POST /internal/v1/orders/"*/payment)
     id=${path#/internal/v1/orders/}
     id=${id%/payment}
@@ -133,7 +143,7 @@ docker run -d --name "$RUN_ID-app" --network "$NETWORK" --memory 160m -p "$PORT:
   -e SPRING_DATASOURCE_URL="jdbc:postgresql://$RUN_ID-db:5432/payment?currentSchema=payment" \
   -e SPRING_DATASOURCE_USERNAME=payment -e SPRING_DATASOURCE_PASSWORD=payment \
   -e PAYMENT_SERVICE_TOKEN="$SERVICE_TOKEN" -e PAYMENT_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
-  -e PAYMENT_SETTLEMENT_DELAY=PT2S -e PAYMENT_SETTLEMENT_INTERVAL=PT1S \
+  -e PAYMENT_SETTLEMENT_DELAY=PT2S -e PAYMENT_SETTLEMENT_INTERVAL=PT1S -e PAYMENT_EVENTS_POLL_INTERVAL=PT1S \
   -e BACKEND_BASE_URL="http://$RUN_ID-backend:4001" \
   "$IMAGE" >/dev/null
 
@@ -214,12 +224,31 @@ contains "admin list" "$listed" '"totalElements":3'
 order_payments=$(curl -sf -H "Authorization: Bearer $CLIENT" "$base/api/v1/orders/101/payments")
 contains "order payments" "$order_payments" "\"id\":\"$payment_id\""
 
-refund_body='{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"}'
-expect "refund without service token" "$(status_of -X POST -H 'Content-Type: application/json' -d "$refund_body" \
-  "$base/internal/v1/payments/refunds")" 401
-refunded=$(curl -sf -X POST -H "X-Service-Token: $SERVICE_TOKEN" -H 'Content-Type: application/json' -d "$refund_body" \
-  "$base/internal/v1/payments/refunds")
-contains "partial refund" "$refunded" '"status":"PARTIALLY_REFUNDED"'
+# Card refunds come from the backend event feed; the inbound refund endpoint is gone.
+docker exec "$RUN_ID-backend" touch /tmp/publish-refund
+expect "no inbound refund endpoint" "$(status_of -X POST -H "X-Service-Token: $SERVICE_TOKEN" \
+  -H 'Content-Type: application/json' -d '{}' "$base/internal/v1/payments/refunds")" 401
+refunded=""
+for _ in $(seq 1 30); do
+  refunded=$(curl -sf -H "Authorization: Bearer $CLIENT" "$base/api/v1/payments/$payment_id")
+  grep -q '"status":"PARTIALLY_REFUNDED"' <<< "$refunded" && break
+  sleep 0.5
+done
+contains "card refund from the event feed" "$refunded" '"status":"PARTIALLY_REFUNDED"'
+contains "refunded amount" "$refunded" '"refundedAmount":12.50'
+feed=""
+for _ in $(seq 1 10); do
+  feed=$(docker exec "$RUN_ID-backend" grep '^FEED .*after=1&' /tmp/requests.log 2>/dev/null | tail -n1 || true)
+  [[ -n "$feed" ]] && break
+  sleep 0.5
+done
+contains "feed cursor advanced past the refund event" "$feed" 'after=1&limit=100&'
+contains "feed request asks only for card refunds" "$feed" 'types=card-refund.requested|'
+contains "feed request carries the service token" "$feed" "|$SERVICE_TOKEN"
+expect "other users' payments are not found" "$(status_of -H "Authorization: Bearer $(token smoke-other ROLE_CLIENT)" \
+  "$base/api/v1/payments/$payment_id")" 404
+expect "other users' orders are not found" "$(status_of -H "Authorization: Bearer $(token smoke-other ROLE_CLIENT)" \
+  "$base/api/v1/orders/101/payments")" 404
 
 if docker logs "$RUN_ID-app" 2>&1 | grep -E -q '4242424242424242|4242 4242 4242 4242|4000000000003220'; then
   echo "FAIL a card number reached the log" >&2
