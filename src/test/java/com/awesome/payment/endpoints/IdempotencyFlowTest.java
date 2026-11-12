@@ -3,6 +3,7 @@ package com.awesome.payment.endpoints;
 import com.awesome.payment.dto.payment.PaymentDto;
 import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.support.AbstractFlowTest;
+import com.awesome.payment.support.MutableClock;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
@@ -26,6 +27,39 @@ class IdempotencyFlowTest extends AbstractFlowTest {
         assertThat(replay.as(PaymentDto.class)).isEqualTo(first);
         assertThat(paymentRepository.count()).isEqualTo(1);
         assertThat(backend.deliveries()).hasSize(1);
+    }
+
+    /**
+     * Regression for 1.2.0, where the 201 carried the clock's nanoseconds while the database kept
+     * microseconds, so the replay and every read returned other timestamps than the 201.
+     */
+    @Test
+    void theCreatedAnswerCarriesTheStoredTimestamps() {
+        clock.set(MutableClock.START.plusNanos(987_074_842));
+        long orderId = backend.order("client", "30.00").id();
+        String key = newKey();
+        PaymentDto created = pay(key, payment(orderId, THREE_DS), clientToken).as(PaymentDto.class);
+
+        PaymentDto replayed = pay(key, payment(orderId, THREE_DS), clientToken).as(PaymentDto.class);
+        PaymentDto read = getJson(PAYMENTS + "/" + created.id(), clientToken).as(PaymentDto.class);
+
+        assertThat(created.createdAt().getNano()).isEqualTo(987_074_000);
+        assertThat(created.updatedAt()).isEqualTo(created.createdAt());
+        assertThat(replayed).isEqualTo(created);
+        assertThat(read).isEqualTo(created);
+    }
+
+    @Test
+    void theThreeDsAnswerCarriesTheStoredTimestamps() {
+        long orderId = backend.order("client", "30.00").id();
+        PaymentDto created = pay(orderId, THREE_DS, clientToken).as(PaymentDto.class);
+        clock.advance(Duration.ofSeconds(5).plusNanos(123_456_789));
+
+        PaymentDto answered = threeDs(created.id(), "123456", clientToken).as(PaymentDto.class);
+        PaymentDto read = getJson(PAYMENTS + "/" + created.id(), clientToken).as(PaymentDto.class);
+
+        assertThat(answered.updatedAt().getNano()).isEqualTo(123_456_000);
+        assertThat(read).isEqualTo(answered);
     }
 
     @Test

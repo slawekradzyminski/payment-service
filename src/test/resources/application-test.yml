@@ -1,7 +1,8 @@
-# JVM tests run on H2 in memory (the H2 driver is test-scoped).
+# JVM tests run on H2 in memory (the H2 driver is test-scoped), in PostgreSQL mode
+# for the native "insert ... on conflict do nothing" of the order payment locks.
 spring:
   datasource:
-    url: jdbc:h2:mem:payment-test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;DATABASE_TO_LOWER=TRUE
+    url: jdbc:h2:mem:payment-test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;DATABASE_TO_LOWER=TRUE;MODE=PostgreSQL
     username: sa
     password: ""
 

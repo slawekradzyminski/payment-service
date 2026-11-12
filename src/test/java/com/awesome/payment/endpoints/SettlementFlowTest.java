@@ -25,11 +25,11 @@ class SettlementFlowTest extends AbstractFlowTest {
         assertThat(backend.deliveries()).isEmpty();
 
         clock.advance(Duration.ofSeconds(9));
-        assertThat(settlementJob.settleDue()).isZero();
+        assertThat(settle()).isZero();
         assertThat(get(processing).status()).isEqualTo(PaymentStatus.PROCESSING);
 
         clock.advance(Duration.ofSeconds(1));
-        assertThat(settlementJob.settleDue()).isEqualTo(1);
+        assertThat(settle()).isEqualTo(1);
 
         PaymentDto settled = get(processing);
         assertThat(settled.status()).isEqualTo(PaymentStatus.CAPTURED);
@@ -38,7 +38,7 @@ class SettlementFlowTest extends AbstractFlowTest {
         assertThat(backend.deliveries()).singleElement()
                 .satisfies(d -> assertThat(d.body().get("status").asString()).isEqualTo("CAPTURED"));
         assertThat(paymentRepository.findById(processing.id()).orElseThrow().getSettleAt()).isNull();
-        assertThat(settlementJob.settleDue()).isZero();
+        assertThat(settle()).isZero();
     }
 
     @Test
@@ -47,7 +47,7 @@ class SettlementFlowTest extends AbstractFlowTest {
         assertThat(processing.status()).isEqualTo(PaymentStatus.PROCESSING);
 
         clock.advance(Duration.ofSeconds(10));
-        settlementJob.settleDue();
+        settle();
 
         PaymentDto failed = get(processing);
         assertThat(failed.status()).isEqualTo(PaymentStatus.FAILED);
@@ -76,7 +76,7 @@ class SettlementFlowTest extends AbstractFlowTest {
         paid(TIMES_OUT);
         clock.advance(Duration.ofSeconds(10));
 
-        assertThat(settlementJob.settleDue()).isEqualTo(2);
+        assertThat(settle()).isEqualTo(2);
     }
 
     private PaymentDto get(PaymentDto payment) {

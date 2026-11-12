@@ -26,7 +26,9 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -34,6 +36,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -64,10 +67,13 @@ public class PaymentService {
     private final Duration settlementDelay;
     private final Duration threeDsTimeout;
     private final OrderPaymentLocks orderLocks;
+    private final TransactionTemplate readTransaction;
+    private final TransactionTemplate writeTransaction;
 
     public PaymentService(PaymentRepository paymentRepository, IdempotencyKeyRepository idempotencyKeys,
                           BackendClient backendClient, FakeCardProvider provider, PaymentResultOutbox outbox,
-                          PaymentSignature signature, OrderPaymentLocks orderLocks, Clock paymentClock,
+                          PaymentSignature signature, OrderPaymentLocks orderLocks,
+                          PlatformTransactionManager transactionManager, Clock paymentClock,
                           @Value("${payment.settlement-delay:PT10S}") Duration settlementDelay,
                           @Value("${payment.three-ds-timeout:PT15M}") Duration threeDsTimeout) {
         this.paymentRepository = paymentRepository;
@@ -80,6 +86,9 @@ public class PaymentService {
         this.settlementDelay = settlementDelay;
         this.threeDsTimeout = threeDsTimeout;
         this.orderLocks = orderLocks;
+        this.readTransaction = new TransactionTemplate(transactionManager);
+        this.readTransaction.setReadOnly(true);
+        this.writeTransaction = new TransactionTemplate(transactionManager);
     }
 
     /** A created payment, or the earlier one when the request is an idempotent replay. */
@@ -89,28 +98,49 @@ public class PaymentService {
     /**
      * Pays an order. Order of checks: Idempotency-Key format (400), replay or conflicting reuse
      * (200 / 409), card number and expiry (400), order exists (404), ownership (403), payable (409).
-     * Everything after the key format runs under the order's payment lock, so concurrent
-     * submissions for one order are serialised: a double submit with the same key becomes a
-     * replay, and only one of two different attempts can become the active payment.
+     * The card checks and the backend order lookup run outside any transaction, so no pooled
+     * connection waits on the backend. The payable check and the insert then run in one short
+     * transaction under the order's payment lock, so concurrent submissions for one order are
+     * serialised: a double submit with the same key becomes a replay (the key is checked again
+     * under the lock), and only one of two different attempts can become the active payment.
      */
-    @Transactional
     public CreateResult create(CustomPrincipal principal, String idempotencyKey, CreatePaymentDto request) {
         if (idempotencyKey == null || !IDEMPOTENCY_KEY.matcher(idempotencyKey).matches()) {
             throw new CustomException(INVALID_KEY, HttpStatus.BAD_REQUEST);
         }
         String fingerprint = fingerprint(request);
-        orderLocks.lock(request.orderId());
-        Optional<IdempotencyKeyEntity> earlier = idempotencyKeys.findByUsernameAndIdempotencyKey(principal.username(), idempotencyKey);
-        if (earlier.isPresent()) {
-            if (!earlier.get().getRequestHash().equals(fingerprint)) {
-                throw new CustomException(KEY_REUSED, HttpStatus.CONFLICT);
-            }
-            return new CreateResult(PaymentDto.from(load(earlier.get().getPaymentId())), true);
+        Optional<CreateResult> replay = readTransaction.execute(
+                status -> replay(principal, idempotencyKey, fingerprint));
+        if (replay != null && replay.isPresent()) {
+            return replay.get();
         }
         ProviderDecision decision = provider.authorize(request.card());
         InternalOrderDto order = backendClient.getOrder(request.orderId());
         if (!principal.isAdmin() && !principal.username().equals(order.username())) {
             throw new CustomException(NOT_YOUR_ORDER, HttpStatus.FORBIDDEN);
+        }
+        return Objects.requireNonNull(writeTransaction.execute(
+                status -> createLocked(principal, idempotencyKey, fingerprint, order, decision)));
+    }
+
+    /** The earlier payment of this key (200), or 409 when the key was used with another request. */
+    private Optional<CreateResult> replay(CustomPrincipal principal, String idempotencyKey, String fingerprint) {
+        Optional<IdempotencyKeyEntity> earlier = idempotencyKeys.findByUsernameAndIdempotencyKey(principal.username(), idempotencyKey);
+        if (earlier.isEmpty()) {
+            return Optional.empty();
+        }
+        if (!earlier.get().getRequestHash().equals(fingerprint)) {
+            throw new CustomException(KEY_REUSED, HttpStatus.CONFLICT);
+        }
+        return Optional.of(new CreateResult(PaymentDto.from(load(earlier.get().getPaymentId())), true));
+    }
+
+    private CreateResult createLocked(CustomPrincipal principal, String idempotencyKey, String fingerprint,
+                                      InternalOrderDto order, ProviderDecision decision) {
+        orderLocks.lock(order.id());
+        Optional<CreateResult> replay = replay(principal, idempotencyKey, fingerprint);
+        if (replay.isPresent()) {
+            return replay.get();
         }
         BigDecimal amount = order.payableAmount() == null ? BigDecimal.ZERO
                 : order.payableAmount().setScale(2, RoundingMode.HALF_UP);
@@ -171,9 +201,9 @@ public class PaymentService {
     /**
      * The order's payments, newest first. The order must exist and belong to the caller (admins see
      * any order); another user's order is 404 "Order not found", like a missing one, so its
-     * existence is not revealed (the backend answers the same).
+     * existence is not revealed (the backend answers the same). The backend lookup runs before
+     * (not inside) the read, so no pooled connection waits on the backend.
      */
-    @Transactional(readOnly = true)
     public List<PaymentDto> forOrder(CustomPrincipal principal, long orderId) {
         InternalOrderDto order = backendClient.getOrder(orderId);
         if (!principal.isAdmin() && !principal.username().equals(order.username())) {

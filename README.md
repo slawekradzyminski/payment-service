@@ -43,7 +43,16 @@ Payment creation for one order is serialised with a row lock (`order_payment_loc
 `SELECT ... FOR UPDATE`, Flyway `V2`), so two concurrent submissions can never both
 become the active payment, and a double submit with the same `Idempotency-Key` is
 answered as a replay. (A partial unique index was not used: H2, the test database,
-does not support `WHERE` on indexes.)
+does not support `WHERE` on indexes.) A missing lock row is created with
+`INSERT ... ON CONFLICT DO NOTHING` in the payment's own transaction, and the card
+checks and the backend order lookup run before that transaction, so a request
+never needs a second pooled connection or keeps one busy while it waits for the
+backend: many concurrent payments share the pool of three
+(`spring.datasource.hikari.maximum-pool-size`).
+
+Timestamps come from a clock truncated to microseconds, the precision PostgreSQL
+stores, so the 201 of a new payment carries exactly the `createdAt`/`updatedAt`
+that the replay and every later read return.
 
 ### Test cards
 
@@ -87,7 +96,9 @@ do not consume the key.
   `{events:[{sequence, id, type, occurredAt, orderId, username, data}], nextCursor, hasMore}`.
 
 Results go through a transactional outbox (`payment_outbox`): written with the
-payment change, sent right after the commit, and retried every 30 seconds with
+payment change, sent right after the commit (by the dispatcher's own worker thread,
+so the committing request or job never waits for the backend while holding a
+database connection), and retried every 30 seconds with
 exponential backoff (30 s doubling to 30 min, at most 10 attempts) while the
 backend answers 5xx or is unreachable. A 409 ("Order is not payable", for example
 the order was cancelled during 3-D Secure) to a capture voids the payment
@@ -200,7 +211,10 @@ No Docker, Postgres or backend is needed. Flow tests boot the service on H2 (`te
 profile) with `FakeBackend`, an in-memory implementation of the backend's result
 rules that verifies the signature independently and serves an in-memory event feed,
 and a `MutableClock`. The settlement job, the outbox retry and the event feed poller
-are switched off in tests and driven explicitly.
+are switched off in tests and driven explicitly; flow-test helpers wait for the
+dispatcher's after-commit deliveries before they return. H2 runs in PostgreSQL mode
+(for `ON CONFLICT DO NOTHING`), and `ConcurrentPaymentFlowTest` sends 12 simultaneous
+first payments through the production pool of three connections.
 `RestBackendClientContractTest` pins every internal-API request with
 `MockRestServiceServer`, including the `X-Request-Id` and child `traceparent` headers.
 `FakeBackend` records the correlation each call was made under, `CorrelationFlowTest`

@@ -3,10 +3,8 @@ package com.awesome.payment.endpoints;
 import com.awesome.payment.client.OrderStatus;
 import com.awesome.payment.dto.payment.PaymentDto;
 import com.awesome.payment.entity.PaymentStatus;
-import com.awesome.payment.service.SettlementJob;
 import com.awesome.payment.support.AbstractFlowTest;
 import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
 
 import java.time.Duration;
 
@@ -14,19 +12,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ThreeDsExpiryFlowTest extends AbstractFlowTest {
 
-    @Autowired
-    private SettlementJob settlementJob;
-
     @Test
     void theSettlementJobExpiresAnUnansweredChallengeAndNotifiesTheBackend() {
         PaymentDto pending = paid(THREE_DS);
 
         clock.advance(Duration.ofMinutes(15).minusSeconds(1));
-        assertThat(settlementJob.settleDue()).isZero();
+        assertThat(settle()).isZero();
         assertThat(current(pending).status()).isEqualTo(PaymentStatus.REQUIRES_ACTION);
 
         clock.advance(Duration.ofSeconds(1));
-        assertThat(settlementJob.settleDue()).isEqualTo(1);
+        assertThat(settle()).isEqualTo(1);
 
         PaymentDto expired = current(pending);
         assertThat(expired.status()).isEqualTo(PaymentStatus.FAILED);
@@ -56,7 +51,7 @@ class ThreeDsExpiryFlowTest extends AbstractFlowTest {
         assertThat(backend.deliveries()).extracting(d -> d.body().get("status").asString())
                 .containsExactly("FAILED", "CAPTURED");
         assertThat(backend.order(pending.orderId()).status()).isEqualTo(OrderStatus.PAID);
-        assertThat(settlementJob.settleDue()).isZero();
+        assertThat(settle()).isZero();
     }
 
     @Test

@@ -8,6 +8,8 @@ import com.awesome.payment.repository.PaymentOutboxRepository;
 import com.awesome.payment.repository.PaymentRepository;
 import com.awesome.payment.repository.ProcessedEventRepository;
 import com.awesome.payment.repository.RefundRepository;
+import com.awesome.payment.service.SettlementJob;
+import com.awesome.payment.service.notification.PaymentResultDispatcher;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -23,6 +25,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -66,6 +69,8 @@ public abstract class AbstractFlowTest {
     @Autowired protected EventFeedPoller poller;
     @Autowired protected EventCursorRepository eventCursors;
     @Autowired protected ProcessedEventRepository processedEvents;
+    @Autowired private PaymentResultDispatcher resultDispatcher;
+    @Autowired private SettlementJob settlementJobUnderTest;
 
     @BeforeEach
     void resetBackend() {
@@ -75,6 +80,7 @@ public abstract class AbstractFlowTest {
 
     @AfterEach
     void cleanDatabase() {
+        awaitResultDelivery();
         refundRepository.deleteAll();
         outboxRepository.deleteAll();
         idempotencyKeyRepository.deleteAll();
@@ -82,6 +88,23 @@ public abstract class AbstractFlowTest {
         orderPaymentLocks.deleteAll();
         processedEvents.deleteAll();
         eventCursors.deleteAll();
+    }
+
+    /**
+     * Waits for the result deliveries the dispatcher's worker was triggered for (they run after
+     * the commit, off the committing thread).
+     */
+    protected void awaitResultDelivery() {
+        if (!resultDispatcher.awaitTriggered(Duration.ofSeconds(10))) {
+            throw new IllegalStateException("Payment result dispatch did not finish in time");
+        }
+    }
+
+    /** Runs the settlement job once and waits for the results it queued to be delivered. */
+    protected int settle() {
+        int settled = settlementJobUnderTest.settleDue();
+        awaitResultDelivery();
+        return settled;
     }
 
     protected static String newKey() {
@@ -145,7 +168,9 @@ public abstract class AbstractFlowTest {
             builder.header(HttpHeaders.AUTHORIZATION, "Bearer " + token);
         }
         try {
-            return new Response(mockMvc.perform(builder).andReturn(), jsonMapper);
+            Response response = new Response(mockMvc.perform(builder).andReturn(), jsonMapper);
+            awaitResultDelivery();
+            return response;
         } catch (Exception e) {
             throw new IllegalStateException(e);
         }

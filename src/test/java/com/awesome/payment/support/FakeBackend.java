@@ -58,6 +58,8 @@ public class FakeBackend implements BackendClient {
     private final AtomicLong sequences = new AtomicLong();
     private volatile boolean available = true;
     private volatile long orderLookupDelayMillis;
+    private volatile long resultDelayMillis;
+    private volatile Runnable orderLookupProbe = () -> { };
 
     /**
      * One received result notification, as the backend would see it on the wire; {@code requestId}
@@ -91,6 +93,18 @@ public class FakeBackend implements BackendClient {
         sequences.set(0);
         available = true;
         orderLookupDelayMillis = 0;
+        resultDelayMillis = 0;
+        orderLookupProbe = () -> { };
+    }
+
+    /** Runs {@code probe} on the calling thread during every order lookup. */
+    public void setOrderLookupProbe(Runnable probe) {
+        this.orderLookupProbe = probe;
+    }
+
+    /** Slows down result notifications, like a busy backend answering them. */
+    public void setResultDelayMillis(long millis) {
+        this.resultDelayMillis = millis;
     }
 
     /** Slows down order lookups, widening the window in which concurrent payments could race. */
@@ -135,13 +149,8 @@ public class FakeBackend implements BackendClient {
     @Override
     public InternalOrderDto getOrder(long orderId) {
         call();
-        if (orderLookupDelayMillis > 0) {
-            try {
-                Thread.sleep(orderLookupDelayMillis);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        orderLookupProbe.run();
+        pause(orderLookupDelayMillis);
         InternalOrderDto order = orders.get(orderId);
         if (order == null) {
             throw new BackendException("Order not found", HttpStatus.NOT_FOUND, 404, null);
@@ -152,6 +161,7 @@ public class FakeBackend implements BackendClient {
     @Override
     public synchronized PaymentResultResponse sendPaymentResult(long orderId, String rawBody, String signature) {
         call();
+        pause(resultDelayMillis);
         Integer scripted = scriptedResultStatuses.poll();
         if (scripted != null) {
             if (scripted == 0 || scripted >= 500 || scripted == 401) {
@@ -193,6 +203,17 @@ public class FakeBackend implements BackendClient {
             paidBy.put(orderId, paymentId);
         }
         return remember(requestId, getOrder(orderId));
+    }
+
+    private static void pause(long millis) {
+        if (millis <= 0) {
+            return;
+        }
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Appends a domain event to the feed and returns it (sequence assigned in order). */
