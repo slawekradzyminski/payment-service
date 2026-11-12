@@ -29,6 +29,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -38,6 +41,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -160,10 +164,86 @@ class PaymentResultDispatcherTest {
     }
 
     @Test
-    void anEnqueueTriggersADispatch() {
-        dispatcher(false).afterEnqueue(new PaymentResultOutbox.Enqueued());
+    void anEnqueueTriggersADispatchOnTheWorkerNotOnTheCommittingThread() {
+        AtomicReference<String> sendingThread = new AtomicReference<>();
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString())).thenAnswer(invocation -> {
+            sendingThread.set(Thread.currentThread().getName());
+            return null;
+        });
+        PaymentResultDispatcher dispatcher = dispatcher(false);
 
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(5))).isTrue();
         verify(backend).sendPaymentResult(eq(42L), eq(PAYLOAD), anyString());
+        assertThat(sendingThread.get()).isEqualTo("payment-result-dispatch")
+                .isNotEqualTo(Thread.currentThread().getName());
+    }
+
+    @Test
+    void triggersWhileARunIsQueuedAreCoalesced() throws Exception {
+        CountDownLatch sending = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString())).thenAnswer(invocation -> {
+            sending.countDown();
+            release.await();
+            return null;
+        });
+        PaymentResultDispatcher dispatcher = dispatcher(false);
+
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        assertThat(sending.await(5, TimeUnit.SECONDS)).isTrue();
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        release.countDown();
+
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(5))).isTrue();
+        verify(outbox, times(2)).findDue(any(), anyInt(), any());
+    }
+
+    @Test
+    void aFailedTriggeredRunIsLeftToTheScheduledRetry() {
+        when(outbox.findDue(any(), anyInt(), any())).thenThrow(new IllegalStateException("database down"))
+                .thenReturn(List.of(row));
+        PaymentResultDispatcher dispatcher = dispatcher(false);
+
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(5))).isTrue();
+        verify(backend, never()).sendPaymentResult(anyLong(), anyString(), anyString());
+
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(5))).isTrue();
+        verify(backend).sendPaymentResult(eq(42L), eq(PAYLOAD), anyString());
+    }
+
+    @Test
+    void afterShutdownTriggersAreLeftToTheScheduledRetry() throws Exception {
+        PaymentResultDispatcher dispatcher = dispatcher(false);
+        dispatcher.shutdown();
+
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(1))).isFalse();
+        verify(backend, never()).sendPaymentResult(anyLong(), anyString(), anyString());
+        dispatcher.dispatchDue();
+        verify(backend).sendPaymentResult(eq(42L), eq(PAYLOAD), anyString());
+    }
+
+    @Test
+    void awaitingASlowRunTimesOut() throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString())).thenAnswer(invocation -> {
+            release.await();
+            return null;
+        });
+        PaymentResultDispatcher dispatcher = dispatcher(false);
+
+        dispatcher.afterEnqueue(new PaymentResultOutbox.Enqueued());
+
+        assertThat(dispatcher.awaitTriggered(Duration.ofMillis(100))).isFalse();
+        release.countDown();
+        assertThat(dispatcher.awaitTriggered(Duration.ofSeconds(5))).isTrue();
     }
 
     @Test

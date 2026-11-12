@@ -13,9 +13,16 @@ import org.springframework.security.core.GrantedAuthority;
 
 import java.security.KeyPair;
 import java.security.interfaces.RSAPublicKey;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -115,6 +122,47 @@ class JwtTokenValidatorTest {
         }
 
         assertThat(calls[0]).isEqualTo(1);
+    }
+
+    /**
+     * Regression: concurrent first requests used to lose the refetch race. One request fetched
+     * the keys; the others, throttled by the refresh interval, found the cache still empty and
+     * answered 401 "Unknown key id".
+     */
+    @Test
+    void concurrentFirstRequestsAllWaitForTheOneRefetch() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        CountDownLatch fetching = new CountDownLatch(1);
+        FakeBackend backend = new FakeBackend() {
+            @Override
+            public JwkSet jwks() {
+                calls.incrementAndGet();
+                fetching.countDown();
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return TestTokens.jwks();
+            }
+        };
+        JwtTokenValidator fresh = new JwtTokenValidator(new BackendKeyLocator(backend, java.time.Duration.ofHours(1)));
+        String token = TestTokens.token("alice", "ROLE_CLIENT");
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<String>> names = new ArrayList<>();
+            names.add(executor.submit(() -> fresh.authenticate(token).getName()));
+            assertThat(fetching.await(5, TimeUnit.SECONDS)).isTrue();
+            for (int i = 0; i < 7; i++) {
+                names.add(executor.submit(() -> fresh.authenticate(token).getName()));
+            }
+            for (Future<String> name : names) {
+                assertThat(name.get(5, TimeUnit.SECONDS)).isEqualTo("alice");
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+        assertThat(calls.get()).isEqualTo(1);
     }
 
     @Test

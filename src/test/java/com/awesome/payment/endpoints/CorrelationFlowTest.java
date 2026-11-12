@@ -7,7 +7,6 @@ import com.awesome.payment.entity.PaymentOutboxEntity;
 import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.events.CardRefundRequestedHandler;
 import com.awesome.payment.repository.RefundRepository;
-import com.awesome.payment.service.SettlementJob;
 import com.awesome.payment.service.notification.PaymentResultDispatcher;
 import com.awesome.payment.support.AbstractFlowTest;
 import org.junit.jupiter.api.AfterEach;
@@ -40,7 +39,6 @@ class CorrelationFlowTest extends AbstractFlowTest {
     private static final String PARENT = "00f067aa0ba902b7";
     private static final String TRACEPARENT = "00-" + TRACE + "-" + PARENT + "-01";
 
-    @Autowired private SettlementJob settlementJob;
     @Autowired private PaymentResultDispatcher dispatcher;
     @Autowired private RefundRepository refundRepository;
 
@@ -121,7 +119,7 @@ class CorrelationFlowTest extends AbstractFlowTest {
         assertThat(backend.deliveries()).isEmpty();
 
         clock.advance(Duration.ofSeconds(10));
-        assertThat(settlementJob.settleDue()).isEqualTo(1);
+        assertThat(settle()).isEqualTo(1);
 
         assertThat(paymentRepository.findById(processing.id()).orElseThrow().getStatus())
                 .isEqualTo(PaymentStatus.CAPTURED);
