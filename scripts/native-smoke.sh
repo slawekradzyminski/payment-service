@@ -10,7 +10,11 @@
 # once the script publishes it (touch /tmp/publish-refund in the stub). The app logs ECS JSON
 # (LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs, as on the server), and the stub records the
 # X-Request-Id and traceparent of every call, so correlation ids are checked end to end.
+# Order 106's reservation has expired (409 "Order reservation expired"). With SMOKE_TRACING=1 the
+# app runs with TRACING_ENABLED=true and exports its spans over OTLP HTTP to the stub
+# (POST /v1/traces); every other check is the same, since tracing keeps the trace ids.
 #   scripts/native-smoke.sh payment-service:native
+#   SMOKE_TRACING=1 scripts/native-smoke.sh payment-service:native
 set -euo pipefail
 
 IMAGE="${1:?usage: native-smoke.sh IMAGE}"
@@ -24,6 +28,7 @@ TRACE_ID="4bf92f3577b34da6a3ce929d0e0e4736"
 CALLER_SPAN="00f067aa0ba902b7"
 CANCEL_TRACE_ID="0af7651916cd43dd8448eb211c80319c"
 WEBHOOK_SECRET="native-smoke-webhook-secret"
+TRACING="${SMOKE_TRACING:-0}"
 
 cleanup() {
   status=$?
@@ -74,18 +79,28 @@ while IFS= read -r line; do
   esac
 done
 body=""
+if [ "$path" = /v1/traces ]; then
+  # OTLP protobuf (binary): only count the export.
+  [ "$length" -gt 0 ] && head -c "$length" > /dev/null
+  printf 'OTLP %s\n' "$length" >> /tmp/requests.log
+  printf 'HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+  exit 0
+fi
 [ "$length" -gt 0 ] && body=$(head -c "$length")
 status="200 OK"
 case "$method $path" in
   "GET /internal/v1/jwks.json") response=$(cat /srv/jwks.json) ;;
   "GET /internal/v1/orders/"*)
     id=${path##*/}
-    response=$(printf '{"id":%s,"username":"smoke-client","status":"PENDING","totalAmount":42.50,"amountDue":42.50,"items":[]}' "$id") ;;
+    # Backend 3.21.0 snapshot: order 106's stock reservation has expired, the others run until 2099.
+    expires="2099-01-01T00:00:00.123Z"
+    [ "$id" = 106 ] && expires="2020-01-01T00:00:00.000Z"
+    response=$(printf '{"id":%s,"username":"smoke-client","status":"PENDING","totalAmount":42.50,"amountDue":42.50,"reservationExpiresAt":"%s","items":[]}' "$id" "$expires") ;;
   "GET /internal/v1/events?"*)
     printf 'FEED %s|%s\n' "$path" "$token" >> /tmp/requests.log
     after=$(printf '%s' "$path" | sed -n 's/.*[?&]after=\([0-9]*\).*/\1/p')
     if [ "${after:-0}" = 0 ] && [ -f /tmp/publish-refund ]; then
-      response='{"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1","type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":101,"username":"smoke-client","data":{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"},"requestId":"smoke-cancel-1","traceId":"0af7651916cd43dd8448eb211c80319c"}],"nextCursor":1,"hasMore":false}'
+      response='{"events":[{"sequence":1,"id":"00000000-0000-0000-0000-0000000000e1","type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":101,"username":"smoke-client","data":{"requestId":"00000000-0000-0000-0000-00000000a001","orderId":101,"amount":12.50,"reason":"smoke"},"requestId":"smoke-cancel-1","traceId":"0af7651916cd43dd8448eb211c80319c","spanId":"b7ad6b7169203331"}],"nextCursor":1,"hasMore":false}'
     else
       response=$(printf '{"events":[],"nextCursor":%s,"hasMore":false}' "${after:-0}")
     fi ;;
@@ -147,8 +162,12 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
+tracing_env=(-e TRACING_ENABLED=false)
+if [[ "$TRACING" == 1 ]]; then
+  tracing_env=(-e TRACING_ENABLED=true -e TRACING_OTLP_ENDPOINT="http://$RUN_ID-backend:4001/v1/traces")
+fi
 started=$(date +%s)
-docker run -d --name "$RUN_ID-app" --network "$NETWORK" --memory 160m -p "$PORT:4004" \
+docker run -d --name "$RUN_ID-app" --network "$NETWORK" --memory 160m -p "$PORT:4004" "${tracing_env[@]}" \
   -e SPRING_PROFILES_ACTIVE=docker \
   -e SPRING_DATASOURCE_URL="jdbc:postgresql://$RUN_ID-db:5432/payment?currentSchema=payment" \
   -e SPRING_DATASOURCE_USERNAME=payment -e SPRING_DATASOURCE_PASSWORD=payment \
@@ -166,6 +185,9 @@ expect "health" "$(status_of "$base/actuator/health")" 200
 echo "ready after $(( $(date +%s) - started ))s"
 
 expect "prometheus metrics" "$(status_of "$base/actuator/prometheus")" 200
+metrics=$(curl -sf "$base/actuator/prometheus")
+contains "outbox pending gauge" "$metrics" '^payment_outbox_pending '
+contains "outbox failed counter" "$metrics" '^payment_outbox_failed_total '
 docs=$(curl -sf "$base/v3/api-docs")
 contains "OpenAPI lists payment paths" "$docs" '"/api/v1/payments/{id}/3ds"'
 if grep -q '/internal/' <<< "$docs"; then echo "FAIL OpenAPI exposes the internal API" >&2; exit 1; fi
@@ -203,6 +225,9 @@ grep -qi '^Idempotent-Replayed: true' "$WORK/headers" && echo "PASS Idempotent-R
   || { echo "FAIL Idempotent-Replayed header missing" >&2; exit 1; }
 expect "conflicting reuse of the key" "$(tail -n1 <<< "$(pay smoke-key-0001 "$(card 101 '5555 5555 5555 4444')")")" 409
 expect "Luhn-invalid card" "$(tail -n1 <<< "$(pay smoke-key-0002 "$(card 102 '4242 4242 4242 4241')")")" 400
+expired=$(pay smoke-key-0006 "$(card 106 '4242 4242 4242 4242')")
+expect "expired reservation is not paid" "$(tail -n1 <<< "$expired")" 409
+contains "expired reservation message" "$expired" '"message":"Order reservation expired"'
 
 # The result notification reached the stub with the service token and a valid signature.
 result=""
@@ -299,6 +324,22 @@ if grep -E -q '4242424242424242|4242 4242 4242 4242|4000000000003220|40000000000
   exit 1
 fi
 echo "PASS no card numbers or CVC in the log"
+
+if [[ "$TRACING" == 1 ]]; then
+  exported=""
+  for _ in $(seq 1 20); do
+    exported=$(docker exec "$RUN_ID-backend" grep -c '^OTLP ' /tmp/requests.log 2>/dev/null || true)
+    [[ "${exported:-0}" -gt 0 ]] && break
+    sleep 0.5
+  done
+  [[ "${exported:-0}" -gt 0 ]] && echo "PASS spans exported over OTLP ($exported requests)" \
+    || { echo "FAIL no OTLP export with TRACING_ENABLED=true" >&2; exit 1; }
+else
+  if docker exec "$RUN_ID-backend" grep -q '^OTLP ' /tmp/requests.log 2>/dev/null; then
+    echo "FAIL spans exported with tracing off" >&2; exit 1
+  fi
+  echo "PASS nothing exported with tracing off"
+fi
 
 docker stats --no-stream --format 'memory: {{.MemUsage}}' "$RUN_ID-app"
 echo "native smoke test passed"

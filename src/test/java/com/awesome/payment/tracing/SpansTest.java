@@ -90,7 +90,7 @@ class SpansTest {
     @Test
     void aRootSpanWithoutAValidOriginHasNoLink() {
         try (Spans.Scope ignored = spans.root("settle payment", null, "garbage")) {
-            assertThat(MDC.get(Correlation.TRACE_ID)).isNull();
+            assertThat(MDC.get(Correlation.REQUEST_ID)).isNull();
         }
 
         assertThat(kit.exporter.spans()).singleElement()
