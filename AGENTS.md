@@ -26,11 +26,19 @@ documentation, code comments, test names, commit messages and handoff notes.
   skip the event). Transient failures leave the cursor; others skip the event.
 - Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
-- Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first and owns
+- Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first (right after
+  Spring's server observation filter, whose span supplies the ids with tracing on) and owns
   the MDC keys `requestId`/`traceId`/`spanId`; `CorrelationInterceptor` (in `RestBackendClient`)
   sends `X-Request-Id` and a child `traceparent` on every backend call. Work that runs outside a
-  request (outbox delivery, settlement, feed events) must open a `Correlation.open(...)` scope
-  from the stored or received ids and close it; never leave MDC values behind on a pooled thread.
+  request (outbox delivery, settlement, feed events) must open a `Spans` scope (which opens the
+  `Correlation` scope and a span) from the stored or received ids and close it; never leave MDC
+  values behind on a pooled thread.
+- Tracing (lab contract section 4) is compiled in and switched at runtime by `TRACING_ENABLED`
+  (`SwitchableSampler`); never gate tracing beans with `@ConditionalOn*` or Boot's
+  `management.tracing.export.enabled` (AOT freezes them). With tracing off nothing may change:
+  `CorrelationInterceptor` sends the hand-built child `traceparent` only then.
+- Reservation guard: `POST /api/v1/payments` answers 409 "Order reservation expired" when the
+  snapshot's optional `reservationExpiresAt` is not after now; a snapshot without it never expires.
 
 # Verification Commands
 
@@ -67,7 +75,8 @@ explicitly (`EventFeedPoller.poll()`).
 - PITest: run the profile above after normal verification when you change the
   card checks or provider, the payment state machine, the signature, the result
   outbox or dispatcher, settlement and 3-D Secure expiry, refunds, the per-order
-  payment lock or the event feed poller and its handlers. Narrow it
+  payment lock, the reservation guard (`InternalOrderDto`, `PaymentService`) or the event feed
+  poller and its handlers. Narrow it
   for small changes, for example
   `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage -DtargetClasses=com.awesome.payment.service.PaymentStateMachine -DtargetTests=com.awesome.payment.service.PaymentStateMachineTest`.
 - Treat `NO_COVERAGE` as a reachability gap and `SURVIVED` as an assertion gap.
@@ -95,6 +104,8 @@ explicitly (`EventFeedPoller.poll()`).
   migrations, JWT validation, card payments, idempotent replay, 3-D Secure,
   scheduled settlement, the signed result notification, a card refund read from the
   stub's event feed (types filter, cursor), 404 for other users' payments and orders,
-  health, metrics, OpenAPI, correlation ids (response header, notification headers, ECS JSON
-  log fields with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`) and that no card number reaches the log. CI runs it on every push and
+  health, metrics (including the outbox gauge and counter), OpenAPI, the expired-reservation 409,
+  correlation ids (response header, notification headers, ECS JSON
+  log fields with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`) and that no card number reaches the log.
+  `SMOKE_TRACING=1` repeats it with `TRACING_ENABLED=true` and checks the OTLP export. CI runs it on every push and
   pull request.

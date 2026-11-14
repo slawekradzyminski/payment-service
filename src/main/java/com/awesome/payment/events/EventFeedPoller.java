@@ -9,6 +9,8 @@ import com.awesome.payment.entity.EventCursorEntity;
 import com.awesome.payment.entity.ProcessedEventEntity;
 import com.awesome.payment.repository.EventCursorRepository;
 import com.awesome.payment.repository.ProcessedEventRepository;
+import com.awesome.payment.tracing.Spans;
+import io.micrometer.tracing.Span;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.TransientDataAccessException;
@@ -35,7 +37,9 @@ import java.util.stream.Collectors;
  * so one bad event never blocks the feed. Scheduled every {@code payment.events.poll-interval},
  * switched off with {@code payment.events.enabled}. While an event is handled, the MDC holds the
  * event's {@code requestId} and {@code traceId} (when valid), so the card refund of a cancellation
- * logs, and is stored, with the trace of the backend request that cancelled the order.
+ * logs, and is stored, with the trace of the backend request that cancelled the order. With
+ * tracing on, each event is handled in a {@code CONSUMER} span {@code process <type>} whose parent
+ * is the event's {@code traceId}/{@code spanId}, so the cancellation and its refund are one trace.
  */
 @Slf4j
 @Component
@@ -53,11 +57,12 @@ public class EventFeedPoller {
     private final List<String> types;
     private final TransactionTemplate transaction;
     private final Clock paymentClock;
+    private final Spans spans;
     private final boolean enabled;
 
     public EventFeedPoller(BackendClient backendClient, EventCursorRepository cursors,
                            ProcessedEventRepository processedEvents, List<FeedEventHandler> handlers,
-                           PlatformTransactionManager transactionManager, Clock paymentClock,
+                           PlatformTransactionManager transactionManager, Clock paymentClock, Spans spans,
                            @Value("${payment.events.enabled:true}") boolean enabled) {
         this.backendClient = backendClient;
         this.cursors = cursors;
@@ -68,6 +73,7 @@ public class EventFeedPoller {
         this.transaction = new TransactionTemplate(transactionManager);
         this.transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.paymentClock = paymentClock;
+        this.spans = spans;
         this.enabled = enabled;
     }
 
@@ -115,13 +121,16 @@ public class EventFeedPoller {
 
     /** Handles one event; false when it must be retried later (transient failure). */
     private boolean process(FeedEvent event) {
-        try (Correlation.Scope ignored = Correlation.open(Correlation.validRequestId(event.requestId()),
-                Correlation.validTraceId(event.traceId()))) {
-            return handle(event);
+        String traceId = Correlation.validTraceId(event.traceId());
+        try (Spans.Scope span = spans.child("process " + event.type(), Span.Kind.CONSUMER,
+                Correlation.validRequestId(event.requestId()), traceId,
+                traceId == null ? null : Correlation.validSpanId(event.spanId()))) {
+            span.tag("event.id", event.id()).tag("event.type", event.type()).tag("event.sequence", event.sequence());
+            return handle(event, span);
         }
     }
 
-    private boolean handle(FeedEvent event) {
+    private boolean handle(FeedEvent event, Spans.Scope span) {
         try {
             transaction.executeWithoutResult(status -> {
                 EventCursorEntity cursor = lockedCursor();
@@ -149,16 +158,17 @@ public class EventFeedPoller {
                         event.id(), event.sequence());
                 return false;
             }
-            skip(event, e);
+            skip(event, e, span);
             return true;
         } catch (RuntimeException e) {
-            skip(event, e);
+            skip(event, e, span);
             return true;
         }
     }
 
     /** Records a failed event as processed and moves past it; the failure is only logged. */
-    private void skip(FeedEvent event, RuntimeException failure) {
+    private void skip(FeedEvent event, RuntimeException failure, Spans.Scope span) {
+        span.error(failure);
         log.error("Event {} (sequence {}, type {}) failed and is skipped", event.id(), event.sequence(), event.type(),
                 failure);
         transaction.executeWithoutResult(status -> {

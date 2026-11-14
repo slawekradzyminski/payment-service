@@ -67,7 +67,8 @@ public class PaymentController {
     @ApiResponse(responseCode = "404", description = "Order not found",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
     @ApiResponse(responseCode = "409", description = "Order not payable (not PENDING, already paid, or another payment "
-            + "in progress), or Idempotency-Key reused with a different body",
+            + "in progress), \"Order reservation expired\" (the order's reservationExpiresAt has passed), or "
+            + "Idempotency-Key reused with a different body",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))
     @ApiResponse(responseCode = "503", description = "Backend unavailable",
             content = @Content(mediaType = "application/json", schema = @Schema(implementation = ErrorDto.class)))

@@ -5,6 +5,7 @@ import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.entity.Settlement;
 import com.awesome.payment.repository.PaymentRepository;
 import com.awesome.payment.service.notification.PaymentResultOutbox;
+import com.awesome.payment.tracing.Spans;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
@@ -94,7 +95,7 @@ class SettlementJobTest {
 
     private SettlementJob job(boolean enabled) {
         return new SettlementJob(payments, outbox, new InlineTransactionManager(), Clock.fixed(NOW, ZoneOffset.UTC),
-                enabled);
+                Spans.disabled(), enabled);
     }
 
     static class InlineTransactionManager extends AbstractPlatformTransactionManager {

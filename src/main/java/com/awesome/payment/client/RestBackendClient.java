@@ -14,7 +14,8 @@ import java.util.function.Supplier;
 
 /**
  * {@link BackendClient} over HTTP with Spring's {@link RestClient}. Every call carries the
- * service token and the correlation headers ({@code X-Request-Id}, child {@code traceparent}).
+ * service token and the correlation headers ({@code X-Request-Id}, child {@code traceparent}:
+ * hand-built with tracing off, the client span's with tracing on).
  */
 @Slf4j
 public class RestBackendClient implements BackendClient {
@@ -24,11 +25,16 @@ public class RestBackendClient implements BackendClient {
 
     private final RestClient restClient;
 
+    /** A client with tracing off. */
     public RestBackendClient(RestClient.Builder builder, String baseUrl, String serviceToken) {
+        this(builder, baseUrl, serviceToken, false);
+    }
+
+    public RestBackendClient(RestClient.Builder builder, String baseUrl, String serviceToken, boolean tracingEnabled) {
         RestClient.Builder configured = builder
                 .baseUrl(baseUrl)
                 .defaultHeader("Accept", MediaType.APPLICATION_JSON_VALUE)
-                .requestInterceptor(new CorrelationInterceptor())
+                .requestInterceptor(new CorrelationInterceptor(tracingEnabled))
                 .defaultStatusHandler(HttpStatusCode::isError, (request, response) -> {
                     throw BackendErrorMapper.fromResponse(
                             response.getStatusCode(), StreamUtils.copyToByteArray(response.getBody()));

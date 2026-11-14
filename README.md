@@ -20,7 +20,7 @@ another user's order is 403, as the contract specifies.
 
 | Endpoint | Result |
 | --- | --- |
-| `POST /api/v1/payments` (header `Idempotency-Key`, `^[A-Za-z0-9_-]{8,64}$`) | 201 `PaymentDto`; replay 200 + `Idempotent-Replayed: true`; 400 validation / Luhn / expired / bad key; 403 not your order; 404 order; 409 not payable or key reused with another body; 503 backend down |
+| `POST /api/v1/payments` (header `Idempotency-Key`, `^[A-Za-z0-9_-]{8,64}$`) | 201 `PaymentDto`; replay 200 + `Idempotent-Replayed: true`; 400 validation / Luhn / expired / bad key; 403 not your order; 404 order; 409 not payable, `Order reservation expired` or key reused with another body; 503 backend down |
 | `POST /api/v1/payments/{id}/3ds` `{code}` | 200; `123456` captures, anything else fails with `THREE_DS_FAILED`; 404 missing or another user's payment; 409 when not `REQUIRES_ACTION` |
 | `GET /api/v1/payments/{id}` | 200 / 404 (missing, or another user's payment) |
 | `GET /api/v1/orders/{orderId}/payments` | payments of the order, newest first (the order is read from the backend; 404 "Order not found" when it is missing or another user's) |
@@ -31,13 +31,33 @@ another user's order is 403, as the contract specifies.
 Statuses: `REQUIRES_ACTION, PROCESSING, CAPTURED, FAILED, PARTIALLY_REFUNDED, REFUNDED, VOIDED`.
 The amount is the order's `amountDue` (or `totalAmount` when the backend does not send it), USD, scale 2.
 
-An order is payable when the backend reports it `PENDING` and it has no local payment in
+An order is payable when the backend reports it `PENDING`, its stock reservation has not
+expired, and it has no local payment in
 `REQUIRES_ACTION`, `PROCESSING`, `CAPTURED`, `PARTIALLY_REFUNDED` or `REFUNDED`.
 Failed and voided payments do not block a new attempt. A 3-D Secure challenge that
 is not answered within `payment.three-ds-timeout` (default 15 min) fails with
 `THREE_DS_EXPIRED`: the settlement job expires it, and so does a new payment attempt
 for the same order or a late answer (which then gets 409), so the customer can retry
 at once. The FAILED result is sent to the backend like any other failure.
+
+### Reservation guard (backend 3.21.0+)
+
+From backend 3.21.0 a new order's stock is held only until `reservationExpiresAt`
+(default 30 minutes after creation); the backend's expiry job then cancels the still
+`PENDING` order. The order snapshot carries that optional field, and
+`POST /api/v1/payments` answers **409 `{"message":"Order reservation expired"}`** when it
+is not after the service clock's now (the backend expires at `<=` too), so no card is
+charged for an order that is about to be cancelled. Order of the 409 checks: not
+`PENDING` ("Order is not payable", also for an order the backend already cancelled),
+then the expired reservation, then nothing left to pay or a payment in progress ("Order
+is not payable"). A snapshot without the field (older backends, orders created with
+reservations disabled, legacy orders) never expires here. An idempotent replay of a
+payment made before the expiry still returns that payment.
+
+The race the guard cannot close (an order paid in time whose capture reaches the backend
+after the expiry: a `PROCESSING` card that settles later, or a 3-D Secure answer) is the
+existing path: the backend answers the capture with 409 and the payment is voided
+(`ReservationGuardFlowTest`).
 
 Payment creation for one order is serialised with a row lock (`order_payment_locks`,
 `SELECT ... FOR UPDATE`, Flyway `V2`), so two concurrent submissions can never both
@@ -86,14 +106,16 @@ do not consume the key.
 `BackendClient` (Spring `RestClient`, 2 s connect / 10 s read timeout) calls
 `/internal/v1` on `backend.base-url` with `X-Service-Token: PAYMENT_SERVICE_TOKEN`:
 
-- `GET /internal/v1/orders/{id}`: order snapshot (`username`, `status`, `totalAmount`, `amountDue`);
+- `GET /internal/v1/orders/{id}`: order snapshot (`username`, `status`, `totalAmount`, `amountDue`,
+  optional `reservationExpiresAt`);
 - `POST /internal/v1/orders/{id}/payment`: result notification
   `{requestId, paymentId, status: CAPTURED|FAILED, amount, currency, failureCode}`, header
   `X-Payment-Signature: t=<epochSeconds>,v1=<hex HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, t + "." + rawBody)>`.
   The stored body is sent byte for byte and re-signed on every attempt.
 - `GET /internal/v1/jwks.json`: access-token verification keys;
 - `GET /internal/v1/events?after={cursor}&limit=100&types=card-refund.requested`: the domain event feed
-  `{events:[{sequence, id, type, occurredAt, orderId, username, data}], nextCursor, hasMore}`.
+  `{events:[{sequence, id, type, occurredAt, orderId, username, data, requestId, traceId, spanId}], nextCursor, hasMore}`
+  (the correlation ids are optional; `spanId` comes with backend 3.21.0).
 
 Results go through a transactional outbox (`payment_outbox`): written with the
 payment change, sent right after the commit (by the dispatcher's own worker thread,
@@ -104,6 +126,13 @@ backend answers 5xx or is unreachable. A 409 ("Order is not payable", for exampl
 the order was cancelled during 3-D Secure) to a capture voids the payment
 (`VOIDED`, `refundedAmount = amount`, `failureCode = ORDER_NOT_PAYABLE`). Any
 other rejection (401 signature, 422 amount mismatch) is final and logged.
+
+Outbox metrics (ADR 3 outbox convention, on `/actuator/prometheus`):
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `payment.outbox.pending` (`payment_outbox_pending`) | gauge | rows not sent and not given up (`sent_at` null, `attempts` < 10), counted in the database on each scrape |
+| `payment.outbox.failed` (`payment_outbox_failed_total`) | counter | rows this instance gave up on: a final rejection, or the 10th failed attempt. A 409 that voids the capture is handled, not counted |
 
 Authentication uses the backend's RS256 access tokens (roles in the `auth` claim),
 verified with the public keys from the backend's JWKS, cached by `kid` and refetched
@@ -155,6 +184,39 @@ The ids survive persisted hand-offs (Flyway `V4`, nullable columns):
   trace of the cancel/refund request that caused it, and the refund row keeps them
   (`correlation_request_id`, `trace_id`).
 
+### Tracing (off by default)
+
+payment-service is traced with Micrometer Tracing over the OpenTelemetry bridge and the
+OTLP HTTP exporter (the tracing parts of Spring Boot's OpenTelemetry starter, sending with the
+JDK HTTP client; the same set as warehouse-service), compiled into the native image.
+Propagation is W3C `traceparent` only, without baggage. It is off unless `TRACING_ENABLED=true`; then spans go to
+`TRACING_OTLP_ENDPOINT` (default `http://jaeger:4318/v1/traces`) with service name
+`payment-service`:
+
+| Span | Kind | Parent |
+| --- | --- | --- |
+| `http <method> <path>` (Spring Boot) | `SERVER` | the incoming W3C `traceparent` (the gateway always sends one), so the trace id is the one in the logs |
+| `http <method>` to the backend (Spring Boot) | `CLIENT` | the current span; the backend gets this span's `traceparent` |
+| `process <type>` (`EventFeedPoller`) | `CONSUMER` | the feed event's `traceId`/`spanId`: a cancellation and the refund it triggers are one trace. Without `spanId` (backends before 3.21.0) the trace id is kept under a made-up parent id; without ids it starts a new trace |
+| `dispatch payment-result` (`PaymentResultDispatcher`, every attempt) | `PRODUCER` | the row's stored `traceparent` (the request that created the payment) |
+| `settle payment` (`SettlementJob`) | internal | none: a new trace per settlement, linked to the span of the request that created the payment; the result is still dispatched in that request's trace |
+
+Spring AOT fixes Spring Boot's tracing bean conditions when the native image is built,
+so tracing is always wired and `TRACING_ENABLED` is read at runtime by the sampler
+(`SwitchableSampler`): off, nothing is sampled (even under a sampled caller), so nothing is
+recorded or exported; on, sampling is parent-based with `TRACING_SAMPLING_PROBABILITY`
+(default `1.0`) for new traces, and a backend call outside any traced work (the feed
+poll, the startup JWKS fetch) never starts a trace. Spring's observations of the
+`@Scheduled` ticks and of Spring Security's filter chain are switched off (they would add a
+trace every few seconds and five spans per request; their timers were not on any
+dashboard); the HTTP server and client timers stay. With tracing off the backend calls
+keep the hand-built child `traceparent` and every id stays as described above; with
+tracing on, the MDC `traceId`/`spanId` and the stored `traceparent` are the current
+span's. The MDC stays owned by the correlation code (Micrometer's MDC listener is switched
+off): `CorrelationFilter` runs right after Spring's server observation filter and, with
+tracing on, takes the server span's ids. A stored `traceparent` always has the sampled flag, so with a probability below 1
+a result dispatch can be sampled under an unsampled request.
+
 Plain console lines carry `[traceId,requestId]` (`logging.pattern.correlation`).
 `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs` (set by the server Compose file) switches to
 Spring Boot's ECS JSON, one object per line with `requestId`, `traceId` and `spanId` as
@@ -199,6 +261,9 @@ Profiles:
 | `SPRING_DATASOURCE_URL` / `_USERNAME` / `_PASSWORD` | datasource | see profiles |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | actuator exposure | `health,prometheus` |
 | `LOGGING_STRUCTURED_FORMAT_CONSOLE` | `logging.structured.format.console` | unset (plain lines with `[traceId,requestId]`); `ecs` for JSON lines |
+| `TRACING_ENABLED` | `tracing.enabled` | `false` (no span is sampled or exported) |
+| `TRACING_OTLP_ENDPOINT` | `management.opentelemetry.tracing.export.otlp.endpoint` | `http://jaeger:4318/v1/traces` (OTLP over HTTP) |
+| `TRACING_SAMPLING_PROBABILITY` | `management.tracing.sampling.probability` | `1.0` (new traces only; a caller's decision is followed) |
 
 ## Test
 
@@ -219,6 +284,8 @@ first payments through the production pool of three connections.
 `MockRestServiceServer`, including the `X-Request-Id` and child `traceparent` headers.
 `FakeBackend` records the correlation each call was made under, `CorrelationFlowTest`
 follows the ids through payments, settlement, retries and feed refunds, and
+`TracingFlowTest` and `BackendCallPropagationFlowTest` boot the service with tracing on and
+an in-memory span exporter (and the real `RestBackendClient` against a local HTTP stub), and
 `StructuredLoggingFlowTest` attaches the ECS encoder to check the JSON fields and that no
 JSON line contains a card number or CVC (`CardDataLeakTest` checks the plain lines).
 
@@ -227,6 +294,7 @@ JSON line contains a card number or CVC (`CardDataLeakTest` checks the plain lin
 ```bash
 docker build -t payment-service:local .          # needs ~9 GB for the builder (Docker VM >= 12 GB)
 scripts/native-smoke.sh payment-service:local    # Postgres + busybox backend stub, 160 MiB limit, ECS JSON logs
+SMOKE_TRACING=1 scripts/native-smoke.sh payment-service:local   # same checks with TRACING_ENABLED=true (stub receives OTLP)
 ```
 
 The build stage (`ghcr.io/graalvm/native-image-community:25`) runs

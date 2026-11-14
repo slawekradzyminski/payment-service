@@ -12,6 +12,7 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -36,7 +37,7 @@ class RestBackendClientContractTest {
     private static final String ORDER_JSON = """
             {"id":42,"username":"client","status":"PENDING","fulfilmentState":"NONE",
              "subtotalAmount":140.00,"discountAmount":14.00,"totalAmount":126.00,"amountDue":100.50,
-             "couponCode":"TENOFF","refundedAmount":0.00,
+             "couponCode":"TENOFF","refundedAmount":0.00,"reservationExpiresAt":"2026-11-08T10:45:30.123Z",
              "shippingAddress":{"street":"1 Main St","city":"Krakow","state":"MA","zipCode":"30-001","country":"Poland"},
              "items":[{"productId":3,"productName":"Phone","quantity":2,"unitPrice":70.00}],
              "createdAt":"2026-11-08T10:15:30","updatedAt":"2026-11-08T10:16:00"}""";
@@ -80,6 +81,7 @@ class RestBackendClientContractTest {
         assertThat(order.status()).isEqualTo(OrderStatus.PENDING);
         assertThat(order.totalAmount()).isEqualByComparingTo("126.00");
         assertThat(order.payableAmount()).isEqualByComparingTo("100.50");
+        assertThat(order.reservationExpiresAt()).isEqualTo(Instant.parse("2026-11-08T10:45:30.123Z"));
     }
 
     @Test
@@ -88,7 +90,9 @@ class RestBackendClientContractTest {
                 .andRespond(withSuccess("{\"id\":7,\"username\":\"client\",\"status\":\"PAID\",\"totalAmount\":9.99}",
                         MediaType.APPLICATION_JSON));
 
-        assertThat(client.getOrder(7).payableAmount()).isEqualByComparingTo("9.99");
+        InternalOrderDto order = client.getOrder(7);
+        assertThat(order.payableAmount()).isEqualByComparingTo("9.99");
+        assertThat(order.reservationExpiresAt()).as("older backends send no reservation").isNull();
     }
 
     @Test
@@ -141,7 +145,7 @@ class RestBackendClientContractTest {
                           "type":"card-refund.requested","occurredAt":"2026-11-10T12:00:00Z","orderId":7,
                           "username":"client","data":{"requestId":"00000000-0000-0000-0000-00000000a001",
                           "orderId":7,"amount":12.50,"reason":"Return #1"},"requestId":"gw-req-1",
-                          "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","unknown":true}],
+                          "traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","unknown":true}],
                          "nextCursor":45,"hasMore":true}""", MediaType.APPLICATION_JSON));
 
         EventFeedPage page = client.events(41, 100, List.of("card-refund.requested", "order.cancelled"));
@@ -160,6 +164,7 @@ class RestBackendClientContractTest {
             assertThat(event.data().get("requestId").asString()).isEqualTo("00000000-0000-0000-0000-00000000a001");
             assertThat(event.requestId()).isEqualTo("gw-req-1");
             assertThat(event.traceId()).isEqualTo(TRACE_ID);
+            assertThat(event.spanId()).isEqualTo("00f067aa0ba902b7");
         });
     }
 
@@ -175,6 +180,7 @@ class RestBackendClientContractTest {
                 .satisfies(event -> {
                     assertThat(event.requestId()).isNull();
                     assertThat(event.traceId()).isNull();
+                    assertThat(event.spanId()).isNull();
                 });
     }
 

@@ -9,6 +9,7 @@ import com.awesome.payment.entity.EventCursorEntity;
 import com.awesome.payment.entity.ProcessedEventEntity;
 import com.awesome.payment.repository.EventCursorRepository;
 import com.awesome.payment.repository.ProcessedEventRepository;
+import com.awesome.payment.tracing.Spans;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.QueryTimeoutException;
@@ -235,7 +236,7 @@ class EventFeedPollerTest {
 
     private EventFeedPoller poller(boolean enabled) {
         return new EventFeedPoller(backend, cursors, processed, List.of(handler), new InlineTransactionManager(), CLOCK,
-                enabled);
+                Spans.disabled(), enabled);
     }
 
     static class InlineTransactionManager extends AbstractPlatformTransactionManager {
