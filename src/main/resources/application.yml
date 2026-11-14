@@ -86,6 +86,11 @@ management:
     sampling:
       # Only used when TRACING_ENABLED=true; a caller's sampled traceparent is always followed.
       probability: ${TRACING_SAMPLING_PROBABILITY:1.0}
+    # W3C traceparent only (the gateway and every service use it), no baggage.
+    propagation:
+      type: w3c
+    baggage:
+      enabled: false
   opentelemetry:
     tracing:
       export:

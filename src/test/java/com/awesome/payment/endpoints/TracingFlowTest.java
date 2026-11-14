@@ -90,6 +90,8 @@ class TracingFlowTest extends AbstractFlowTest {
         assertThat(server.getTraceId()).isEqualTo(TRACE);
         assertThat(server.getParentSpanId()).isEqualTo(PARENT);
         assertThat(server.getName()).isEqualTo("http post /api/v1/payments");
+        assertThat(server.getResource().getAttribute(io.opentelemetry.api.common.AttributeKey.stringKey("service.name")))
+                .isEqualTo("payment-service");
         PaymentEntity payment = paymentRepository.findById(response.as(PaymentDto.class).id()).orElseThrow();
         assertThat(payment.getTraceparent()).isEqualTo("00-" + TRACE + "-" + server.getSpanId() + "-01");
         assertThat(payment.getCorrelationRequestId()).isEqualTo("req-trace-1");

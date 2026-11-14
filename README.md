@@ -186,9 +186,10 @@ The ids survive persisted hand-offs (Flyway `V4`, nullable columns):
 
 ### Tracing (off by default)
 
-payment-service is traced with Spring Boot's OpenTelemetry starter (Micrometer Tracing,
-OpenTelemetry bridge, OTLP HTTP exporter with the JDK HTTP client), compiled into the
-native image. It is off unless `TRACING_ENABLED=true`; then spans go to
+payment-service is traced with Micrometer Tracing over the OpenTelemetry bridge and the
+OTLP HTTP exporter (the tracing parts of Spring Boot's OpenTelemetry starter, sending with the
+JDK HTTP client; the same set as warehouse-service), compiled into the native image.
+Propagation is W3C `traceparent` only, without baggage. It is off unless `TRACING_ENABLED=true`; then spans go to
 `TRACING_OTLP_ENDPOINT` (default `http://jaeger:4318/v1/traces`) with service name
 `payment-service`:
 
@@ -211,7 +212,9 @@ trace every few seconds and five spans per request; their timers were not on any
 dashboard); the HTTP server and client timers stay. With tracing off the backend calls
 keep the hand-built child `traceparent` and every id stays as described above; with
 tracing on, the MDC `traceId`/`spanId` and the stored `traceparent` are the current
-span's. A stored `traceparent` always has the sampled flag, so with a probability below 1
+span's. The MDC stays owned by the correlation code (Micrometer's MDC listener is switched
+off): `CorrelationFilter` runs right after Spring's server observation filter and, with
+tracing on, takes the server span's ids. A stored `traceparent` always has the sampled flag, so with a probability below 1
 a result dispatch can be sampled under an unsampled request.
 
 Plain console lines carry `[traceId,requestId]` (`logging.pattern.correlation`).

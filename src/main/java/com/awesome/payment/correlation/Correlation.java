@@ -112,10 +112,18 @@ public final class Correlation {
      * removes the key. Closing the scope restores what was there before.
      */
     public static Scope open(String requestId, String traceId) {
+        return open(requestId, traceId, traceId == null ? null : newSpanId());
+    }
+
+    /**
+     * Puts {@code requestId}, {@code traceId} and {@code spanId} (this hop's span, for example the
+     * current tracing span) into the MDC; a null value removes the key. Closing restores them.
+     */
+    public static Scope open(String requestId, String traceId, String spanId) {
         Scope scope = new Scope(MDC.get(REQUEST_ID), MDC.get(TRACE_ID), MDC.get(SPAN_ID));
         set(REQUEST_ID, requestId);
         set(TRACE_ID, traceId);
-        set(SPAN_ID, traceId == null ? null : newSpanId());
+        set(SPAN_ID, spanId);
         return scope;
     }
 

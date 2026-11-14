@@ -78,26 +78,20 @@
             <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
         <!--
-          Tracing (lab contract section 4): Spring Boot's OpenTelemetry starter = Micrometer Tracing
-          with the OpenTelemetry bridge and the OTLP exporter. Compiled in always and switched at
-          runtime with TRACING_ENABLED (see TracingConfig): Spring AOT fixes bean conditions such as
-          management.tracing.export.enabled at build time. The OTLP metrics registry is left out
-          (metrics stay on the Prometheus scrape), and the OTLP exporter uses the JDK HTTP client
-          instead of OkHttp (no Kotlin runtime in the native image).
+          Tracing (lab contract section 4): Micrometer Tracing over the OpenTelemetry bridge with the
+          OTLP HTTP exporter, i.e. the tracing parts of spring-boot-starter-opentelemetry without its
+          OTLP metrics registry (metrics stay on the Prometheus scrape); same set as warehouse-service.
+          Compiled in always and switched at runtime with TRACING_ENABLED (see TracingConfig): Spring
+          AOT fixes bean conditions such as management.tracing.export.enabled at build time. The
+          exporter uses the JDK HTTP client instead of OkHttp (no Kotlin runtime in the native image).
         -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-opentelemetry</artifactId>
-            <exclusions>
-                <exclusion>
-                    <groupId>io.micrometer</groupId>
-                    <artifactId>micrometer-registry-otlp</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>io.opentelemetry</groupId>
-                    <artifactId>opentelemetry-exporter-otlp</artifactId>
-                </exclusion>
-            </exclusions>
+            <artifactId>spring-boot-micrometer-tracing-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-otel</artifactId>
         </dependency>
         <dependency>
             <groupId>io.opentelemetry</groupId>

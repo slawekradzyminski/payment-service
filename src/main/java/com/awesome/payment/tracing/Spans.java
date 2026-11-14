@@ -13,14 +13,12 @@ import org.springframework.stereotype.Component;
  * feed consumer, the result outbox dispatcher and the settlement job. HTTP server spans and the
  * spans of calls to the backend come from Spring Boot's instrumentation.
  *
- * <p>Every method opens the {@link Correlation} scope the work ran under before tracing existed
- * ({@code requestId} in the MDC, restored on close) and makes a span current, so the MDC
- * {@code traceId}/{@code spanId} (set by Micrometer Tracing), the stored {@code traceparent} of
- * anything written and the {@code traceparent} sent to the backend are this span's. With tracing off
- * ({@code TRACING_ENABLED=false}, the default) the span is not sampled, so nothing is recorded or
- * exported, but it still carries the trace id: the instrumented {@code RestClient} opens its own
- * (unsampled) span around each call, whose trace must stay the work's trace for the hand-built
- * {@code traceparent} and the MDC of 1.2.
+ * <p>The MDC belongs to the correlation code (Micrometer's MDC listener is switched off, see
+ * {@link TracingConfig}). Every method opens a {@link Correlation} scope, restored on close. With
+ * tracing off ({@code TRACING_ENABLED=false}, the default) that is all, exactly as in 1.2: no span
+ * is started. With tracing on, a span is started and made current, and the MDC gets its trace and
+ * span id, so the logs, the stored {@code traceparent} of anything written and the
+ * {@code traceparent} sent to the backend are this span's.
  */
 @Component
 public class Spans {
@@ -47,15 +45,13 @@ public class Spans {
      * A span of {@code kind} (null: internal) whose parent is {@code traceId}/{@code parentSpanId}
      * (a remote parent, for example a feed event's or a stored {@code traceparent}'s ids). A valid
      * trace id without a span id still keeps the trace: the parent span id is then made up, so
-     * tracing UIs show the parent as missing. Without a valid trace id the span starts a new trace
-     * (tracing off: no span at all, so the MDC has no trace id, as in 1.2).
-     * The MDC gets {@code requestId}; invalid ids must be filtered out by the caller.
+     * tracing UIs show the parent as missing. Without a valid trace id the span starts a new trace.
+     * Tracing off: only {@code Correlation.open(requestId, traceId)}. Invalid ids must be filtered
+     * out by the caller.
      */
     public Scope child(String name, Span.Kind kind, String requestId, String traceId, String parentSpanId) {
-        Correlation.Scope correlation = Correlation.open(requestId, traceId);
-        if (!tracingEnabled && traceId == null) {
-            // Nothing to carry: like 1.2, the work runs without a trace id in the MDC.
-            return new Scope(correlation, null, null);
+        if (!tracingEnabled) {
+            return new Scope(Correlation.open(requestId, traceId), null, null);
         }
         Span.Builder builder = tracer.spanBuilder().name(name);
         if (kind != null) {
@@ -66,30 +62,38 @@ public class Spans {
         } else {
             builder.setParent(context(traceId, parentSpanId == null ? Correlation.newSpanId() : parentSpanId));
         }
-        return started(correlation, builder);
+        return started(requestId, builder);
     }
 
     /**
      * An internal span that starts a new trace, linked to the span of {@code originTraceparent}
-     * (when valid). With tracing off it is an (unsampled) child of the origin instead, so the logs
-     * keep the origin's trace id, as in 1.2.
+     * (when valid). Tracing off: the MDC keeps the origin's trace id, as in 1.2.
      */
     public Scope root(String name, String requestId, String originTraceparent) {
         Correlation.TraceParent origin = Correlation.parseTraceparent(originTraceparent);
         if (!tracingEnabled) {
-            return child(name, null, requestId, origin == null ? null : origin.traceId(),
-                    origin == null ? null : origin.parentId());
+            return new Scope(Correlation.open(requestId, origin == null ? null : origin.traceId()), null, null);
         }
-        Correlation.Scope correlation = Correlation.open(requestId, null);
         Span.Builder builder = tracer.spanBuilder().name(name).setNoParent();
         if (origin != null) {
             builder.addLink(new Link(context(origin.traceId(), origin.parentId())));
         }
-        return started(correlation, builder);
+        return started(requestId, builder);
     }
 
-    private Scope started(Correlation.Scope correlation, Span.Builder builder) {
+    /** The current span's ids with tracing on (in a request: the HTTP server span), otherwise null. */
+    public TraceContext current() {
+        if (!tracingEnabled) {
+            return null;
+        }
+        Span span = tracer.currentSpan();
+        return span == null ? null : span.context();
+    }
+
+    private Scope started(String requestId, Span.Builder builder) {
         Span span = builder.start();
+        Correlation.Scope correlation = Correlation.open(requestId, span.context().traceId(),
+                span.context().spanId());
         return new Scope(correlation, span, tracer.withSpan(span));
     }
 

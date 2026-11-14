@@ -1,6 +1,7 @@
 package com.awesome.payment.tracing;
 
 import io.micrometer.observation.ObservationPredicate;
+import io.micrometer.tracing.otel.bridge.Slf4JEventListener;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -28,6 +29,25 @@ public class TracingConfig {
     Sampler otelSampler(@Value("${tracing.enabled:false}") boolean enabled,
                         @Value("${management.tracing.sampling.probability:1.0}") double probability) {
         return new SwitchableSampler(enabled, probability);
+    }
+
+    /**
+     * Leaves the MDC to the correlation code ({@code CorrelationFilter}, {@link Spans}), so the
+     * {@code traceId}/{@code spanId} keys behave the same with tracing on and off and an
+     * instrumented backend call never rewrites them (same choice as warehouse-service).
+     */
+    @Bean
+    Slf4JEventListener otelSlf4JEventListener() {
+        return new SilentMdcListener();
+    }
+
+    /** Ignores span scope events. */
+    static final class SilentMdcListener extends Slf4JEventListener {
+
+        @Override
+        public void onEvent(Object event) {
+            // The trace and span ids in the MDC are set by Correlation scopes.
+        }
     }
 
     /**

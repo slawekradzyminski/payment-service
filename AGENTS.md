@@ -26,7 +26,8 @@ documentation, code comments, test names, commit messages and handoff notes.
   skip the event). Transient failures leave the cursor; others skip the event.
 - Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
-- Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first and owns
+- Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first (right after
+  Spring's server observation filter, whose span supplies the ids with tracing on) and owns
   the MDC keys `requestId`/`traceId`/`spanId`; `CorrelationInterceptor` (in `RestBackendClient`)
   sends `X-Request-Id` and a child `traceparent` on every backend call. Work that runs outside a
   request (outbox delivery, settlement, feed events) must open a `Spans` scope (which opens the
