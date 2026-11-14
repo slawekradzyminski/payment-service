@@ -291,6 +291,7 @@ JSON line contains a card number or CVC (`CardDataLeakTest` checks the plain lin
 ```bash
 docker build -t payment-service:local .          # needs ~9 GB for the builder (Docker VM >= 12 GB)
 scripts/native-smoke.sh payment-service:local    # Postgres + busybox backend stub, 160 MiB limit, ECS JSON logs
+SMOKE_TRACING=1 scripts/native-smoke.sh payment-service:local   # same checks with TRACING_ENABLED=true (stub receives OTLP)
 ```
 
 The build stage (`ghcr.io/graalvm/native-image-community:25`) runs

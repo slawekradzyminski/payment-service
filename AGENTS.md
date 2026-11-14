@@ -103,6 +103,8 @@ explicitly (`EventFeedPoller.poll()`).
   migrations, JWT validation, card payments, idempotent replay, 3-D Secure,
   scheduled settlement, the signed result notification, a card refund read from the
   stub's event feed (types filter, cursor), 404 for other users' payments and orders,
-  health, metrics, OpenAPI, correlation ids (response header, notification headers, ECS JSON
-  log fields with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`) and that no card number reaches the log. CI runs it on every push and
+  health, metrics (including the outbox gauge and counter), OpenAPI, the expired-reservation 409,
+  correlation ids (response header, notification headers, ECS JSON
+  log fields with `LOGGING_STRUCTURED_FORMAT_CONSOLE=ecs`) and that no card number reaches the log.
+  `SMOKE_TRACING=1` repeats it with `TRACING_ENABLED=true` and checks the OTLP export. CI runs it on every push and
   pull request.
