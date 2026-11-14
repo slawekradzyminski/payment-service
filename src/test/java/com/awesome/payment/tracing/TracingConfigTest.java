@@ -17,6 +17,15 @@ class TracingConfigTest {
     }
 
     @Test
+    void micrometersMdcListenerIsSilencedSoTheCorrelationCodeOwnsTheMdc() {
+        io.micrometer.tracing.otel.bridge.Slf4JEventListener listener = config.otelSlf4JEventListener();
+
+        assertThat(listener).isInstanceOf(TracingConfig.SilentMdcListener.class);
+        listener.onEvent(new Object());
+        assertThat(org.slf4j.MDC.getCopyOfContextMap()).isNullOrEmpty();
+    }
+
+    @Test
     void schedulerTicksAndSpringSecurityAreNotObservedButHttpIs() {
         ObservationPredicate predicate = config.noSchedulerOrSecurityObservations();
         Observation.Context context = new Observation.Context();
