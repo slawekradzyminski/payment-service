@@ -7,6 +7,8 @@ import com.awesome.payment.entity.PaymentOutboxEntity;
 import com.awesome.payment.repository.PaymentOutboxRepository;
 import com.awesome.payment.repository.PaymentRepository;
 import com.awesome.payment.service.PaymentStateMachine;
+import com.awesome.payment.tracing.Spans;
+import io.micrometer.tracing.Span;
 import lombok.extern.slf4j.Slf4j;
 import jakarta.annotation.PreDestroy;
 import org.springframework.beans.factory.annotation.Value;
@@ -45,7 +47,10 @@ import java.util.function.Consumer;
  * ("Order is not payable") to a capture voids the payment. Any other rejection is final. The
  * backend handles each requestId once, so a retry after a lost response is harmless. Each delivery
  * runs (and logs) under the correlation ids stored with the row, so the backend receives the
- * original {@code X-Request-Id} and a child of the original trace.
+ * original {@code X-Request-Id} and a child of the original trace; with tracing on, in a
+ * {@code PRODUCER} span {@code dispatch payment-result} whose parent is the stored
+ * {@code traceparent}. Pending rows are exported as the gauge {@code payment.outbox.pending} and
+ * rows given up are counted by {@code payment.outbox.failed} ({@link PaymentOutboxMetrics}).
  */
 @Slf4j
 @Component
@@ -56,6 +61,7 @@ public class PaymentResultDispatcher {
     static final Duration FIRST_BACKOFF = Duration.ofSeconds(30);
     static final Duration MAX_BACKOFF = Duration.ofMinutes(30);
     private static final int ERROR_LENGTH = 500;
+    static final String SPAN_NAME = "dispatch payment-result";
 
     private final PaymentOutboxRepository outboxRepository;
     private final PaymentRepository paymentRepository;
@@ -63,6 +69,8 @@ public class PaymentResultDispatcher {
     private final PaymentSignature signature;
     private final TransactionTemplate transaction;
     private final Clock paymentClock;
+    private final Spans spans;
+    private final PaymentOutboxMetrics metrics;
     private final boolean retryEnabled;
     /** One worker: after-commit deliveries run here, in order, off the committing thread. */
     private final ExecutorService worker = Executors.newSingleThreadExecutor(
@@ -72,7 +80,8 @@ public class PaymentResultDispatcher {
 
     public PaymentResultDispatcher(PaymentOutboxRepository outboxRepository, PaymentRepository paymentRepository,
                                    BackendClient backendClient, PaymentSignature signature,
-                                   PlatformTransactionManager transactionManager, Clock paymentClock,
+                                   PlatformTransactionManager transactionManager, Clock paymentClock, Spans spans,
+                                   PaymentOutboxMetrics metrics,
                                    @Value("${payment.notifications.retry-enabled:true}") boolean retryEnabled) {
         this.outboxRepository = outboxRepository;
         this.paymentRepository = paymentRepository;
@@ -83,6 +92,8 @@ public class PaymentResultDispatcher {
         // finished transaction and silently lose every write.
         this.transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         this.paymentClock = paymentClock;
+        this.spans = spans;
+        this.metrics = metrics;
         this.retryEnabled = retryEnabled;
     }
 
@@ -166,26 +177,36 @@ public class PaymentResultDispatcher {
     }
 
     private boolean send(PaymentOutboxEntity row) {
-        try (Correlation.Scope ignored = correlation(row)) {
-            return deliver(row);
+        try (Spans.Scope span = span(row)) {
+            span.tag("payment.result.request_id", row.getRequestId()).tag("payment.id", row.getPaymentId())
+                    .tag("order.id", row.getOrderId()).tag("payment.result.attempt", row.getAttempts() + 1);
+            return deliver(row, span);
         }
     }
 
-    /** The row's ids; a row without any (written before 1.2.0) keeps the current trace. */
-    private static Correlation.Scope correlation(PaymentOutboxEntity row) {
-        if (row.getCorrelationRequestId() == null && row.getTraceparent() == null) {
-            return Correlation.open(Correlation.currentRequestId(), Correlation.currentTraceId());
+    /**
+     * The row's ids; a row without any (written before 1.2.0) keeps the current trace (with tracing
+     * on: a child of the current span, or a new trace outside one).
+     */
+    private Spans.Scope span(PaymentOutboxEntity row) {
+        String requestId = row.getCorrelationRequestId();
+        Correlation.TraceParent parent = Correlation.parseTraceparent(row.getTraceparent());
+        if (requestId == null && row.getTraceparent() == null) {
+            requestId = Correlation.currentRequestId();
+            parent = Correlation.parseTraceparent(Correlation.currentTraceparent());
         }
-        return Correlation.open(row.getCorrelationRequestId(), Correlation.traceIdOf(row.getTraceparent()));
+        return spans.child(SPAN_NAME, Span.Kind.PRODUCER, requestId, parent == null ? null : parent.traceId(),
+                parent == null ? null : parent.parentId());
     }
 
-    private boolean deliver(PaymentOutboxEntity row) {
+    private boolean deliver(PaymentOutboxEntity row, Spans.Scope span) {
         try {
             backendClient.sendPaymentResult(row.getOrderId(), row.getPayload(), signature.sign(row.getPayload()));
             update(row.getId(), delivered -> delivered.setSentAt(LocalDateTime.now(paymentClock)));
             log.info("Delivered payment result {} for order {}", row.getRequestId(), row.getOrderId());
             return true;
         } catch (BackendException e) {
+            span.error(e);
             handleFailure(row, e);
             return false;
         }
@@ -213,12 +234,17 @@ public class PaymentResultDispatcher {
         boolean retryable = e.isTransient();
         log.warn("Could not deliver payment result {} for order {} ({}): {}", row.getRequestId(), row.getOrderId(),
                 retryable ? "will retry" : "giving up", error);
+        AtomicBoolean givenUp = new AtomicBoolean();
         update(row.getId(), failed -> {
             int attempts = retryable ? failed.getAttempts() + 1 : MAX_ATTEMPTS;
             failed.setAttempts(attempts);
             failed.setLastError(error);
             failed.setNextAttemptAt(LocalDateTime.now(paymentClock).plus(backoff(attempts)));
+            givenUp.set(attempts >= MAX_ATTEMPTS);
         });
+        if (givenUp.get()) {
+            metrics.givenUp();
+        }
     }
 
     private void update(Long id, Consumer<PaymentOutboxEntity> change) {

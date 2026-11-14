@@ -8,6 +8,8 @@ import com.awesome.payment.entity.PaymentOutboxEntity;
 import com.awesome.payment.entity.PaymentStatus;
 import com.awesome.payment.repository.PaymentOutboxRepository;
 import com.awesome.payment.repository.PaymentRepository;
+import com.awesome.payment.tracing.Spans;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -57,6 +59,8 @@ class PaymentResultDispatcherTest {
     private final Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
     private final PaymentSignature signature = new PaymentSignature("secret", clock);
     private final RecordingTransactionManager transactions = new RecordingTransactionManager();
+    private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+    private final PaymentOutboxMetrics metrics = new PaymentOutboxMetrics(meters, outbox);
     private PaymentOutboxEntity row;
     private PaymentEntity payment;
 
@@ -152,6 +156,61 @@ class PaymentResultDispatcherTest {
         assertThat(payment.getStatus()).isEqualTo(PaymentStatus.FAILED);
         verify(payments, never()).save(any());
         assertThat(row.getSentAt()).isEqualTo(LOCAL_NOW);
+    }
+
+    @Test
+    void aDeliveredResultIsNotCountedAsFailed() {
+        dispatcher(true).dispatchDue();
+
+        assertThat(failedCount()).isZero();
+    }
+
+    @Test
+    void aFinalRejectionIsCountedAsFailedOnce() {
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
+                .thenThrow(new BackendException("Amount mismatch", HttpStatus.UNPROCESSABLE_CONTENT, 422, null));
+
+        dispatcher(true).dispatchDue();
+
+        assertThat(failedCount()).isEqualTo(1.0);
+    }
+
+    @Test
+    void aRetryableFailureIsNotCountedUntilTheLastAttempt() {
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
+                .thenThrow(BackendErrorMapper.fromResponse(HttpStatus.SERVICE_UNAVAILABLE, null));
+        row.setAttempts(8);
+
+        dispatcher(true).dispatchDue();
+        assertThat(row.getAttempts()).isEqualTo(9);
+        assertThat(failedCount()).isZero();
+
+        dispatcher(true).dispatchDue();
+        assertThat(row.getAttempts()).isEqualTo(10);
+        assertThat(failedCount()).isEqualTo(1.0);
+    }
+
+    @Test
+    void aVoidedCaptureIsHandledNotCountedAsFailed() {
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
+                .thenThrow(new BackendException("Order is not payable", HttpStatus.CONFLICT, 409, null));
+
+        dispatcher(true).dispatchDue();
+
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.VOIDED);
+        assertThat(failedCount()).isZero();
+    }
+
+    @Test
+    void thePendingGaugeCountsRowsNotSentAndNotGivenUp() {
+        when(outbox.countPending(10)).thenReturn(3L);
+
+        assertThat(meters.get("payment.outbox.pending").gauge().value()).isEqualTo(3.0);
+        assertThat(meters.get("payment.outbox.failed").counter().count()).isZero();
+    }
+
+    private double failedCount() {
+        return meters.get("payment.outbox.failed").counter().count();
     }
 
     @Test
@@ -269,7 +328,8 @@ class PaymentResultDispatcherTest {
     }
 
     private PaymentResultDispatcher dispatcher(boolean retryEnabled) {
-        return new PaymentResultDispatcher(outbox, payments, backend, signature, transactions, clock, retryEnabled);
+        return new PaymentResultDispatcher(outbox, payments, backend, signature, transactions, clock, Spans.disabled(),
+                metrics, retryEnabled);
     }
 
     /** Runs callbacks inline and records the requested propagation. */

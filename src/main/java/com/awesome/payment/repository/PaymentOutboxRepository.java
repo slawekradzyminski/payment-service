@@ -21,4 +21,8 @@ public interface PaymentOutboxRepository extends JpaRepository<PaymentOutboxEnti
                                       Pageable pageable);
 
     List<PaymentOutboxEntity> findByPaymentIdOrderById(UUID paymentId);
+
+    /** Rows still to be delivered: not sent and not given up (ADR 3 "pending"), due or backing off. */
+    @Query("select count(o) from PaymentOutboxEntity o where o.sentAt is null and o.attempts < :maxAttempts")
+    long countPending(@Param("maxAttempts") int maxAttempts);
 }

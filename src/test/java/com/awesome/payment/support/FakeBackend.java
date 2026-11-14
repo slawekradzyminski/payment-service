@@ -19,6 +19,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HexFormat;
@@ -133,13 +134,30 @@ public class FakeBackend implements BackendClient {
         return order;
     }
 
+    /**
+     * A PENDING order whose stock reservation runs out at {@code reservationExpiresAt} (backend
+     * 3.21.0 order snapshot); see {@link #expireReservation(long)} for the backend's expiry job.
+     */
+    public InternalOrderDto reservedOrder(String username, String total, Instant reservationExpiresAt) {
+        long id = ids.incrementAndGet();
+        InternalOrderDto order = new InternalOrderDto(id, username, OrderStatus.PENDING, new BigDecimal(total), null,
+                reservationExpiresAt);
+        orders.put(id, order);
+        return order;
+    }
+
+    /** What the backend's ReservationExpiryJob does to a PENDING order past its reservation: cancel it. */
+    public void expireReservation(long orderId) {
+        setStatus(orderId, OrderStatus.CANCELLED);
+    }
+
     public InternalOrderDto order(long id) {
         return orders.get(id);
     }
 
     public void setStatus(long orderId, OrderStatus status) {
         orders.computeIfPresent(orderId, (id, o) -> new InternalOrderDto(o.id(), o.username(), status, o.totalAmount(),
-                o.amountDue()));
+                o.amountDue(), o.reservationExpiresAt()));
     }
 
     public List<Delivery> deliveries() {
@@ -228,8 +246,14 @@ public class FakeBackend implements BackendClient {
     /** Appends an event written by a request with these correlation ids (as the backend's V17 feed does). */
     public FeedEvent publish(UUID eventId, String type, Long orderId, Map<String, Object> data, String requestId,
                              String traceId) {
+        return publish(eventId, type, orderId, data, requestId, traceId, null);
+    }
+
+    /** Appends an event written by a backend span (backend 3.21.0 feed events carry its {@code spanId}). */
+    public FeedEvent publish(UUID eventId, String type, Long orderId, Map<String, Object> data, String requestId,
+                             String traceId, String spanId) {
         FeedEvent event = new FeedEvent(sequences.incrementAndGet(), eventId, type, clock.instant().toString(), orderId,
-                "client", JSON.valueToTree(data), requestId, traceId);
+                "client", JSON.valueToTree(data), requestId, traceId, spanId);
         feed.add(event);
         return event;
     }
@@ -237,7 +261,7 @@ public class FakeBackend implements BackendClient {
     /** Re-appends an already published event (same id) under a new sequence, like a redelivery. */
     public FeedEvent republish(FeedEvent event) {
         FeedEvent copy = new FeedEvent(sequences.incrementAndGet(), event.id(), event.type(), event.occurredAt(),
-                event.orderId(), event.username(), event.data(), event.requestId(), event.traceId());
+                event.orderId(), event.username(), event.data(), event.requestId(), event.traceId(), event.spanId());
         feed.add(copy);
         return copy;
     }
