@@ -77,6 +77,16 @@ class CorrelationTest {
     }
 
     @Test
+    void spanIdsMustBe16LowerCaseHexAndNotAllZeros() {
+        assertThat(Correlation.validSpanId("00f067aa0ba902b7")).isEqualTo("00f067aa0ba902b7");
+        assertThat(Correlation.validSpanId(null)).isNull();
+        assertThat(Correlation.validSpanId("0".repeat(16))).isNull();
+        assertThat(Correlation.validSpanId("00F067AA0BA902B7")).isNull();
+        assertThat(Correlation.validSpanId("00f067aa0ba902b70")).isNull();
+        assertThat(Correlation.validSpanId("00f067aa0ba902b")).isNull();
+    }
+
+    @Test
     void generatedIdsAreValidAndDistinct() {
         Set<String> traces = new HashSet<>();
         for (int i = 0; i < 50; i++) {

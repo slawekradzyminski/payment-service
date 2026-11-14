@@ -51,6 +51,8 @@ public class PaymentService {
     static final String INVALID_KEY = "Idempotency-Key header is required and must match ^[A-Za-z0-9_-]{8,64}$";
     static final String KEY_REUSED = "Idempotency-Key was already used with a different request";
     static final String NOT_PAYABLE = "Order is not payable";
+    /** The order is still PENDING but its stock reservation ran out; the backend is about to cancel it. */
+    static final String RESERVATION_EXPIRED = "Order reservation expired";
     static final String NOT_YOUR_ORDER = "You can only pay for your own orders";
     static final String PAYMENT_NOT_FOUND = "Payment not found";
     /** The backend's wording: another user's order is answered exactly like a missing one. */
@@ -97,7 +99,9 @@ public class PaymentService {
 
     /**
      * Pays an order. Order of checks: Idempotency-Key format (400), replay or conflicting reuse
-     * (200 / 409), card number and expiry (400), order exists (404), ownership (403), payable (409).
+     * (200 / 409), card number and expiry (400), order exists (404), ownership (403), payable (409:
+     * not PENDING, then a reservation that has expired, then nothing left to pay or a payment in
+     * progress).
      * The card checks and the backend order lookup run outside any transaction, so no pooled
      * connection waits on the backend. The payable check and the insert then run in one short
      * transaction under the order's payment lock, so concurrent submissions for one order are
@@ -145,7 +149,13 @@ public class PaymentService {
         BigDecimal amount = order.payableAmount() == null ? BigDecimal.ZERO
                 : order.payableAmount().setScale(2, RoundingMode.HALF_UP);
         expireAbandonedThreeDs(order.id());
-        if (order.status() != OrderStatus.PENDING || amount.signum() <= 0
+        if (order.status() != OrderStatus.PENDING) {
+            throw new CustomException(NOT_PAYABLE, HttpStatus.CONFLICT);
+        }
+        if (order.reservationExpired(paymentClock.instant())) {
+            throw new CustomException(RESERVATION_EXPIRED, HttpStatus.CONFLICT);
+        }
+        if (amount.signum() <= 0
                 || paymentRepository.existsByOrderIdAndStatusIn(order.id(), PaymentStateMachine.BLOCKING)) {
             throw new CustomException(NOT_PAYABLE, HttpStatus.CONFLICT);
         }

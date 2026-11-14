@@ -2,6 +2,7 @@ package com.awesome.payment.config;
 
 import com.awesome.payment.client.BackendClient;
 import com.awesome.payment.client.RestBackendClient;
+import com.awesome.payment.tracing.Spans;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -29,9 +30,10 @@ public class BackendClientConfig {
             HttpClient backendHttpClient,
             @Value("${backend.base-url}") String baseUrl,
             @Value("${payment.service-token:}") String serviceToken,
-            @Value("${backend.read-timeout:10s}") Duration readTimeout) {
+            @Value("${backend.read-timeout:10s}") Duration readTimeout,
+            Spans spans) {
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(backendHttpClient);
         requestFactory.setReadTimeout(readTimeout);
-        return new RestBackendClient(builder.requestFactory(requestFactory), baseUrl, serviceToken);
+        return new RestBackendClient(builder.requestFactory(requestFactory), baseUrl, serviceToken, spans.enabled());
     }
 }

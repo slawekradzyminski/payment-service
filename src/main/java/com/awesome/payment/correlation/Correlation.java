@@ -29,6 +29,7 @@ public final class Correlation {
     private static final Pattern TRACEPARENT_PATTERN =
             Pattern.compile("^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$");
     private static final Pattern TRACE_ID_PATTERN = Pattern.compile("^[0-9a-f]{32}$");
+    private static final Pattern SPAN_ID_PATTERN = Pattern.compile("^[0-9a-f]{16}$");
     private static final String SAMPLED = "01";
     private static final HexFormat HEX = HexFormat.of();
 
@@ -47,6 +48,12 @@ public final class Correlation {
     /** {@code candidate} when it is a valid trace id (32 lower-case hex, not all zeros), otherwise null. */
     public static String validTraceId(String candidate) {
         return candidate != null && TRACE_ID_PATTERN.matcher(candidate).matches() && !allZeros(candidate)
+                ? candidate : null;
+    }
+
+    /** {@code candidate} when it is a valid span id (16 lower-case hex, not all zeros), otherwise null. */
+    public static String validSpanId(String candidate) {
+        return candidate != null && SPAN_ID_PATTERN.matcher(candidate).matches() && !allZeros(candidate)
                 ? candidate : null;
     }
 

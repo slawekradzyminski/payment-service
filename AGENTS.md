@@ -29,8 +29,15 @@ documentation, code comments, test names, commit messages and handoff notes.
 - Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first and owns
   the MDC keys `requestId`/`traceId`/`spanId`; `CorrelationInterceptor` (in `RestBackendClient`)
   sends `X-Request-Id` and a child `traceparent` on every backend call. Work that runs outside a
-  request (outbox delivery, settlement, feed events) must open a `Correlation.open(...)` scope
-  from the stored or received ids and close it; never leave MDC values behind on a pooled thread.
+  request (outbox delivery, settlement, feed events) must open a `Spans` scope (which opens the
+  `Correlation` scope and a span) from the stored or received ids and close it; never leave MDC
+  values behind on a pooled thread.
+- Tracing (lab contract section 4) is compiled in and switched at runtime by `TRACING_ENABLED`
+  (`SwitchableSampler`); never gate tracing beans with `@ConditionalOn*` or Boot's
+  `management.tracing.export.enabled` (AOT freezes them). With tracing off nothing may change:
+  `CorrelationInterceptor` sends the hand-built child `traceparent` only then.
+- Reservation guard: `POST /api/v1/payments` answers 409 "Order reservation expired" when the
+  snapshot's optional `reservationExpiresAt` is not after now; a snapshot without it never expires.
 
 # Verification Commands
 
@@ -67,7 +74,8 @@ explicitly (`EventFeedPoller.poll()`).
 - PITest: run the profile above after normal verification when you change the
   card checks or provider, the payment state machine, the signature, the result
   outbox or dispatcher, settlement and 3-D Secure expiry, refunds, the per-order
-  payment lock or the event feed poller and its handlers. Narrow it
+  payment lock, the reservation guard (`InternalOrderDto`, `PaymentService`) or the event feed
+  poller and its handlers. Narrow it
   for small changes, for example
   `./mvnw -Pmutation-testing test-compile pitest:mutationCoverage -DtargetClasses=com.awesome.payment.service.PaymentStateMachine -DtargetTests=com.awesome.payment.service.PaymentStateMachineTest`.
 - Treat `NO_COVERAGE` as a reachability gap and `SURVIVED` as an assertion gap.

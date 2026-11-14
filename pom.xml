@@ -11,7 +11,7 @@
 
     <groupId>com.awesome</groupId>
     <artifactId>payment-service</artifactId>
-    <version>1.2.1</version>
+    <version>1.3.0</version>
     <packaging>jar</packaging>
 
     <name>payment-service</name>
@@ -76,6 +76,42 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+        <!--
+          Tracing (lab contract section 4): Spring Boot's OpenTelemetry starter = Micrometer Tracing
+          with the OpenTelemetry bridge and the OTLP exporter. Compiled in always and switched at
+          runtime with TRACING_ENABLED (see TracingConfig): Spring AOT fixes bean conditions such as
+          management.tracing.export.enabled at build time. The OTLP metrics registry is left out
+          (metrics stay on the Prometheus scrape), and the OTLP exporter uses the JDK HTTP client
+          instead of OkHttp (no Kotlin runtime in the native image).
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-opentelemetry</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.micrometer</groupId>
+                    <artifactId>micrometer-registry-otlp</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>io.opentelemetry</groupId>
+                    <artifactId>opentelemetry-exporter-otlp</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.opentelemetry</groupId>
+                    <artifactId>opentelemetry-exporter-sender-okhttp</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-sender-jdk</artifactId>
         </dependency>
 
         <!-- JWT validation; same library and version as the backend that issues the tokens -->
@@ -327,6 +363,7 @@
                         </dependencies>
                         <configuration>
                             <targetClasses>
+                                <param>com.awesome.payment.client.InternalOrderDto</param>
                                 <param>com.awesome.payment.service.provider.CardChecks</param>
                                 <param>com.awesome.payment.service.provider.FakeCardProvider</param>
                                 <param>com.awesome.payment.service.PaymentStateMachine</param>
@@ -344,6 +381,7 @@
                                 <param>com.awesome.payment.service.*Test</param>
                                 <param>com.awesome.payment.service.provider.*Test</param>
                                 <param>com.awesome.payment.service.notification.*Test</param>
+                                <param>com.awesome.payment.client.*Test</param>
                                 <param>com.awesome.payment.events.*Test</param>
                                 <param>com.awesome.payment.endpoints.*Test</param>
                             </targetTests>
