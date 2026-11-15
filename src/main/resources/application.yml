@@ -23,6 +23,18 @@ spring:
     schemas: payment
     default-schema: payment
     create-schemas: true
+  # Artemis client of the broker transport (payment.events.transport=broker); SPRING_ARTEMIS_BROKER_URL,
+  # _USER and _PASSWORD override it. It connects only when the listener starts. The plain connection
+  # factory: Spring's CachingConnectionFactory hands out JDK proxies the native image cannot create, and
+  # the listener container keeps its own connection.
+  jms:
+    cache:
+      enabled: false
+  artemis:
+    mode: native
+    broker-url: tcp://activemq:61616
+    user: admin
+    password: admin
   jmx:
     enabled: false
   main:
@@ -63,10 +75,17 @@ payment:
   notifications:
     retry-enabled: ${PAYMENT_NOTIFICATIONS_RETRY_ENABLED:true}
     retry-interval: ${PAYMENT_NOTIFICATIONS_RETRY_INTERVAL:PT30S}
-  # Polls the backend event feed (GET /internal/v1/events) for card-refund.requested.
+  # Receives card-refund.requested from the backend: by polling the event feed (GET /internal/v1/events,
+  # transport feed) or from this service's Artemis queue (transport broker,
+  # docs/EVENT_BROKER_CONTRACT.md in awesome-localstack).
   events:
     enabled: ${PAYMENT_EVENTS_ENABLED:true}
+    transport: ${EVENTS_TRANSPORT:feed}
     poll-interval: ${PAYMENT_EVENTS_POLL_INTERVAL:PT5S}
+    broker:
+      # Multicast address of the backend's events; this service reads <address>::<address>.payment-service.
+      address: ${EVENTS_BROKER_ADDRESS:awesome.commerce.events}
+      concurrency: ${EVENTS_BROKER_CONCURRENCY:1}
 
 security:
   jwt:
@@ -82,6 +101,10 @@ tracing:
   enabled: ${TRACING_ENABLED:false}
 
 management:
+  # The broker is optional (feed transport by default), so it is not part of application health.
+  health:
+    jms:
+      enabled: false
   tracing:
     sampling:
       # Only used when TRACING_ENABLED=true; a caller's sampled traceparent is always followed.

@@ -236,7 +236,7 @@ class EventFeedPollerTest {
 
     private EventFeedPoller poller(boolean enabled) {
         return new EventFeedPoller(backend, cursors, processed, List.of(handler), new InlineTransactionManager(), CLOCK,
-                Spans.disabled(), enabled);
+                Spans.disabled(), enabled, "feed");
     }
 
     static class InlineTransactionManager extends AbstractPlatformTransactionManager {
