@@ -161,6 +161,27 @@ A refund leaves the payment `PARTIALLY_REFUNDED` or `REFUNDED`. payment-service 
 no inbound internal API any more (the 1.0.0 `POST /internal/v1/payments/refunds`
 endpoint and its service-token filter were removed).
 
+
+### Broker transport (`EVENTS_TRANSPORT=broker`)
+
+The same events can arrive from ActiveMQ Artemis instead of the feed
+(awesome-localstack `docs/EVENT_BROKER_CONTRACT.md`). With
+`payment.events.transport=broker` the poller does not run; a
+`DefaultMessageListenerContainer` (`EventBrokerConfig`, always defined because the native image
+fixes the bean graph, started only in broker mode) reads this service's queue
+`<address>::<address>.payment-service` (address `EVENTS_BROKER_ADDRESS`, default
+`awesome.commerce.events`). Each message body is one feed event; `EventBrokerListener` parses it
+and hands it to `EventFeedPoller#processDelivered`, which runs the same handlers in one
+transaction, skips event ids already in `processed_events` and leaves the feed cursor alone
+(switching back to the feed resumes from it).
+
+Every failure (a body that does not parse, a malformed event, a handler or database error)
+rolls the JMS session back: Artemis redelivers the message after 1, 2, 4 and 8 seconds and then
+moves it to `DLQ.<queue>`. Nothing is skipped silently, unlike the feed. A valid `traceparent`
+message property (the backend relay's `publish <type>` span) becomes the parent of the
+`process <type>` span. The broker is not part of `/actuator/health`; the listener reconnects
+every 5 seconds.
+
 ### Correlation ids and logging
 
 Every request passes `CorrelationFilter` first: a valid incoming `X-Request-Id`
@@ -257,6 +278,9 @@ Profiles:
 | `PAYMENT_SETTLEMENT_ENABLED` / `_INTERVAL` | `payment.settlement.*` | `true` / `PT2S` |
 | `PAYMENT_NOTIFICATIONS_RETRY_ENABLED` / `_RETRY_INTERVAL` | `payment.notifications.*` | `true` / `PT30S` |
 | `PAYMENT_EVENTS_ENABLED` / `PAYMENT_EVENTS_POLL_INTERVAL` | `payment.events.enabled` / `.poll-interval` | `true` / `PT5S` (event feed poller) |
+| `EVENTS_TRANSPORT` | `payment.events.transport` | `feed` (or `broker`: Artemis listener instead of the poller) |
+| `EVENTS_BROKER_ADDRESS` / `EVENTS_BROKER_CONCURRENCY` | `payment.events.broker.address` / `.concurrency` | `awesome.commerce.events` / `1` |
+| `SPRING_ARTEMIS_BROKER_URL` / `_USER` / `_PASSWORD` | `spring.artemis.*` | `tcp://activemq:61616` / `admin` / `admin` (used only in broker mode) |
 | `JWT_JWKS_REFRESH_INTERVAL` | `security.jwt.jwks-refresh-interval` | `10s` |
 | `SPRING_DATASOURCE_URL` / `_USERNAME` / `_PASSWORD` | datasource | see profiles |
 | `MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE` | actuator exposure | `health,prometheus` |
