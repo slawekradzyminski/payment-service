@@ -4,8 +4,9 @@ import com.awesome.payment.client.FeedEvent;
 
 /**
  * Handles one event type of the backend feed. Runs inside the poller's per-event transaction,
- * so it must not commit on its own. Throwing {@link IllegalArgumentException} (malformed payload)
- * or a final {@link com.awesome.payment.client.BackendException} rejection skips the event; any
+ * so it must not commit on its own. Throwing {@link IllegalArgumentException} (malformed payload),
+ * a {@link org.springframework.dao.DataIntegrityViolationException} or a final
+ * {@link com.awesome.payment.client.BackendException} rejection skips the event; any
  * other exception (database, transaction, transient backend or unexpected) leaves it for the next
  * poll ({@link EventFeedPoller#isPoisonEvent}).
  */

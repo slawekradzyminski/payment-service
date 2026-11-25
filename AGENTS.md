@@ -23,9 +23,10 @@ documentation, code comments, test names, commit messages and handoff notes.
 - Event feed handling: one local transaction per event (handle, record in
   `processed_events`, advance `event_cursors`); handlers implement `FeedEventHandler`,
   must be idempotent and must not throw for expected business outcomes. Only poison events
-  (`EventFeedPoller.isPoisonEvent`: `IllegalArgumentException`, `JacksonException`, a final
-  backend 4xx) are skipped; every database, transaction, transient backend or unexpected
-  failure leaves the cursor for the next poll.
+  (`EventFeedPoller.isPoisonEvent`: `IllegalArgumentException`, `JacksonException`,
+  `DataIntegrityViolationException` and its subclasses, a final backend 4xx) are skipped and
+  logged at ERROR; every other database, transaction, transient backend or unexpected failure
+  leaves the cursor for the next poll.
 - Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
 - Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first (right after

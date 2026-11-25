@@ -18,6 +18,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.orm.jpa.JpaSystemException;
@@ -123,7 +124,7 @@ class EventFeedPollerTest {
                 new CannotCreateTransactionException("Could not open JPA EntityManager"),
                 new JpaSystemException(new RuntimeException("connection closed")),
                 new TransactionSystemException("Could not commit JPA transaction"),
-                new DataIntegrityViolationException("duplicate key"),
+                new QueryTimeoutException("statement timeout"),
                 new PersistenceException("connection reset"),
                 new IllegalStateException("wrapped", new SQLException("I/O error")),
                 new IllegalArgumentException("wrapped", new DataAccessResourceFailureException("gone")),
@@ -164,6 +165,10 @@ class EventFeedPollerTest {
                 new IllegalArgumentException("card-refund.requested event has no requestId"),
                 new NumberFormatException("For input string: \"x\""),
                 jsonFailure(),
+                new DataIntegrityViolationException("value too long for type character varying(255)"),
+                new DuplicateKeyException("duplicate key value violates unique constraint"),
+                new TransactionSystemException("Could not commit JPA transaction",
+                        new DataIntegrityViolationException("check constraint violated")),
                 new BackendException("Unprocessable", HttpStatus.UNPROCESSABLE_CONTENT, 422, null));
     }
 
@@ -180,6 +185,7 @@ class EventFeedPollerTest {
         assertThat(processedIds).containsExactly(poison.id(), next.id());
         assertThat(cursor.getLastSequence()).isEqualTo(2);
         assertThat(EventFeedPoller.isPoisonEvent(failure)).isTrue();
+        assertThat(EventFeedPoller.isInfrastructureFailure(failure)).isFalse();
     }
 
     @ParameterizedTest

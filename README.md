@@ -156,12 +156,13 @@ books the refund, records the event id in `processed_events` and advances the cu
 - the same `requestId` in another event books nothing (idempotent per `requestId`);
 - an order without a captured card payment books nothing (logged);
 - an amount above what is still refundable books nothing (logged as a warning);
-- a poison event (a malformed payload, or a final backend 4xx rejection of what it refers to)
-  is logged with the event id and skipped (recorded as processed, cursor advances), so one bad
+- a poison event (a malformed payload, data the database refuses as an integrity violation such
+  as a duplicate key, or a final backend 4xx rejection of what it refers to) is logged at ERROR
+  with the event id and skipped (recorded as processed, cursor advances), so one bad
   event never blocks the feed;
 - every other failure stops the poll without moving the cursor and the next poll retries the
-  same event: the backend being unavailable (no response, 5xx, 401, 403, 408, 429), any database
-  or transaction failure (a dropped or refused connection, a failed commit, a lock timeout) and
+  same event: the backend being unavailable (no response, 5xx, 401, 403, 408, 429), any other
+  database or transaction failure (a dropped or refused connection, a failed commit, a timeout) and
   any unexpected error (logged as an error). A refund is never dropped because the database
   was briefly unreachable.
 

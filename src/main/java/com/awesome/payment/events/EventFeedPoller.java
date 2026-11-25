@@ -15,6 +15,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import jakarta.persistence.PersistenceException;
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -36,7 +37,8 @@ import java.util.stream.Collectors;
  * asking only for the types a {@link FeedEventHandler} consumes. Each event is handled in its own
  * transaction that also records it in {@code processed_events} and advances the cursor, so a crash
  * never loses or repeats an event. An event id seen before is skipped. Only an event whose content
- * makes it fail ({@link #isPoisonEvent}: a malformed payload, or a final backend rejection) is logged
+ * makes it fail ({@link #isPoisonEvent}: a malformed payload, data the database refuses as an
+ * integrity violation, or a final backend rejection) is logged at ERROR
  * with its id and skipped, so one bad event never blocks the feed. Every other failure (the backend
  * unavailable, any database or transaction failure such as a dropped connection, or an unexpected
  * error) stops the poll without moving the cursor; the next tick retries, so no refund is lost. Scheduled every {@code payment.events.poll-interval},
@@ -226,10 +228,15 @@ public class EventFeedPoller {
     /**
      * A failure caused by the event's content, which no retry can fix: a malformed payload
      * ({@link IllegalArgumentException}, including number and UUID parse errors), unreadable JSON
-     * ({@link JacksonException}) or a final backend rejection of what the event refers to. A database
-     * or transaction failure anywhere in the cause chain is never poison, whatever wraps it.
+     * ({@link JacksonException}), data the database refuses ({@link DataIntegrityViolationException}
+     * and its subclasses such as {@code DuplicateKeyException}, anywhere in the cause chain) or a final
+     * backend rejection of what the event refers to. Any other database or transaction failure
+     * anywhere in the cause chain is never poison, whatever wraps it.
      */
     static boolean isPoisonEvent(RuntimeException e) {
+        if (causedBy(e, DataIntegrityViolationException.class)) {
+            return true;
+        }
         if (isInfrastructureFailure(e)) {
             return false;
         }
@@ -240,14 +247,22 @@ public class EventFeedPoller {
     }
 
     /**
-     * A lost or refused database connection, a failed commit or any other data-access or transaction
-     * infrastructure error ({@link DataAccessException}, {@link TransactionException},
-     * {@link PersistenceException}, {@link SQLException}) anywhere in the cause chain.
+     * A lost or refused database connection, a failed commit, a timeout or any other data-access or
+     * transaction infrastructure error ({@link DataAccessException}, {@link TransactionException},
+     * {@link PersistenceException}, {@link SQLException}) anywhere in the cause chain; an integrity
+     * violation is the event's data, not the infrastructure, so it does not count.
      */
     static boolean isInfrastructureFailure(Throwable e) {
+        if (causedBy(e, DataIntegrityViolationException.class)) {
+            return false;
+        }
+        return causedBy(e, DataAccessException.class) || causedBy(e, TransactionException.class)
+                || causedBy(e, PersistenceException.class) || causedBy(e, SQLException.class);
+    }
+
+    private static boolean causedBy(Throwable e, Class<? extends Throwable> type) {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
-            if (cause instanceof DataAccessException || cause instanceof TransactionException
-                    || cause instanceof PersistenceException || cause instanceof SQLException) {
+            if (type.isInstance(cause)) {
                 return true;
             }
         }
