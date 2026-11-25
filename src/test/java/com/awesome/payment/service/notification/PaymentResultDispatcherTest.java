@@ -14,9 +14,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 import org.springframework.transaction.support.DefaultTransactionStatus;
@@ -115,18 +117,71 @@ class PaymentResultDispatcherTest {
         assertThat(row.getNextAttemptAt()).isEqualTo(LOCAL_NOW.plusSeconds(30));
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {401, 403, 408, 429})
+    void unauthorizedBackendIsRetriedNotAbandoned(int status) {
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
+                .thenThrow(BackendErrorMapper.fromResponse(HttpStatusCode.valueOf(status), null))
+                .thenReturn(null);
+        PaymentResultDispatcher dispatcher = dispatcher(true);
+
+        assertThat(dispatcher.dispatchDue()).isZero();
+
+        assertThat(row.getAttempts()).isEqualTo(1).isLessThan(PaymentResultDispatcher.MAX_ATTEMPTS);
+        assertThat(row.getNextAttemptAt()).isEqualTo(LOCAL_NOW.plusSeconds(30)).isAfter(LOCAL_NOW);
+        assertThat(row.getLastError()).startsWith(status + " ");
+        assertThat(row.getSentAt()).isNull();
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+        assertThat(failedCount()).isZero();
+
+        assertThat(dispatcher.dispatchDue()).isEqualTo(1);
+        assertThat(row.getSentAt()).isEqualTo(LOCAL_NOW);
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+    }
+
     @Test
-    void clientErrorsAreFinal() {
+    void finalRejectionOfCaptureVoidsIt() {
         when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
                 .thenThrow(new BackendException("Amount mismatch", HttpStatus.UNPROCESSABLE_CONTENT, 422, null));
 
-        dispatcher(true).dispatchDue();
+        assertThat(dispatcher(true).dispatchDue()).isZero();
 
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.VOIDED);
+        assertThat(payment.getRefundedAmount()).isEqualByComparingTo("12.00");
+        assertThat(payment.getFailureCode()).isEqualTo("ORDER_NOT_PAYABLE");
+        assertThat(payment.getFailureMessage())
+                .isEqualTo("The backend rejected the payment result (422 Amount mismatch); the capture was voided");
+        assertThat(payment.getUpdatedAt()).isEqualTo(LOCAL_NOW);
+        verify(payments).save(payment);
         assertThat(row.getAttempts()).isEqualTo(10);
         assertThat(row.getLastError()).isEqualTo("422 Amount mismatch");
         assertThat(row.getSentAt()).isNull();
         assertThat(row.getNextAttemptAt()).isEqualTo(LOCAL_NOW.plusMinutes(30));
-        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+        verify(outbox).save(row);
+    }
+
+    @Test
+    void finalRejectionOfAFailedResultLeavesThePaymentAlone() {
+        payment.setStatus(PaymentStatus.FAILED);
+        when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
+                .thenThrow(new BackendException("Order not found", HttpStatus.NOT_FOUND, 404, null));
+
+        dispatcher(true).dispatchDue();
+
+        assertThat(payment.getStatus()).isEqualTo(PaymentStatus.FAILED);
+        verify(payments, never()).save(any());
+        assertThat(row.getAttempts()).isEqualTo(10);
+        assertThat(row.getSentAt()).isNull();
+        assertThat(failedCount()).isEqualTo(1.0);
+    }
+
+    @Test
+    void voidMessagesFitTheFailureMessageColumn() {
+        assertThat(PaymentResultDispatcher.voidMessage("422 x"))
+                .isEqualTo("The backend rejected the payment result (422 x); the capture was voided");
+        String exact = "4".repeat(255 - "The backend rejected the payment result (); the capture was voided".length());
+        assertThat(PaymentResultDispatcher.voidMessage(exact)).hasSize(255).endsWith("voided");
+        assertThat(PaymentResultDispatcher.voidMessage(exact + "4")).hasSize(255).endsWith("the capture was vo...");
     }
 
     @Test
@@ -138,6 +193,7 @@ class PaymentResultDispatcherTest {
 
         assertThat(payment.getStatus()).isEqualTo(PaymentStatus.VOIDED);
         assertThat(payment.getRefundedAmount()).isEqualByComparingTo("12.00");
+        assertThat(payment.getFailureMessage()).isEqualTo("The order was no longer payable; the capture was voided");
         verify(payments).save(payment);
         assertThat(row.getSentAt()).isEqualTo(LOCAL_NOW);
         assertThat(row.getLastError()).isEqualTo("409 Order is not payable");
@@ -167,6 +223,7 @@ class PaymentResultDispatcherTest {
 
     @Test
     void aFinalRejectionIsCountedAsFailedOnce() {
+        // The capture is voided, but the rejection stays visible as a given-up row.
         when(backend.sendPaymentResult(anyLong(), anyString(), anyString()))
                 .thenThrow(new BackendException("Amount mismatch", HttpStatus.UNPROCESSABLE_CONTENT, 422, null));
 

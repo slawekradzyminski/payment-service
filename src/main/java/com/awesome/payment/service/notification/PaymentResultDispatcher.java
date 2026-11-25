@@ -42,9 +42,11 @@ import java.util.function.Consumer;
  * that thread still holds its pooled connection until the commit completes, so sending there
  * would need a second connection and keep the first one busy during the HTTP call. Triggers that
  * arrive while a run is still queued are coalesced into it; a lost trigger (shutdown, failure) is
- * covered by the scheduled retry, so delivery stays at least once. No response or a 5xx is retried with
- * exponential backoff (30 s doubling to 30 min, at most {@value #MAX_ATTEMPTS} attempts). A 409
- * ("Order is not payable") to a capture voids the payment. Any other rejection is final. The
+ * covered by the scheduled retry, so delivery stays at least once. No response, a 5xx, or a 401, 403,
+ * 408 or 429 ({@link BackendException#isTransient()}) is retried with exponential backoff (30 s
+ * doubling to 30 min, at most {@value #MAX_ATTEMPTS} attempts). A 409 ("Order is not payable") to a
+ * capture voids the payment and closes the row. Any other rejection is final: it voids a capture too
+ * (the backend will never book it, so the money goes back to the card) and the row is given up. The
  * backend handles each requestId once, so a retry after a lost response is harmless. Each delivery
  * runs (and logs) under the correlation ids stored with the row, so the backend receives the
  * original {@code X-Request-Id} and a child of the original trace; with tracing on, in a
@@ -61,6 +63,7 @@ public class PaymentResultDispatcher {
     static final Duration FIRST_BACKOFF = Duration.ofSeconds(30);
     static final Duration MAX_BACKOFF = Duration.ofMinutes(30);
     private static final int ERROR_LENGTH = 500;
+    private static final int FAILURE_MESSAGE_LENGTH = 255;
     static final String SPAN_NAME = "dispatch payment-result";
 
     private final PaymentOutboxRepository outboxRepository;
@@ -217,34 +220,66 @@ public class PaymentResultDispatcher {
         if (e.getBackendStatus() == HttpStatus.CONFLICT.value()) {
             log.warn("Backend refused payment result {} for order {}: {}; voiding the capture",
                     row.getRequestId(), row.getOrderId(), e.getMessage());
-            transaction.executeWithoutResult(status -> {
-                paymentRepository.findById(row.getPaymentId()).ifPresent(payment -> {
-                    if (PaymentStateMachine.voidCapture(payment, LocalDateTime.now(paymentClock))) {
-                        paymentRepository.save(payment);
-                    }
-                });
-                outboxRepository.findById(row.getId()).ifPresent(done -> {
-                    done.setSentAt(LocalDateTime.now(paymentClock));
-                    done.setLastError(error);
-                    outboxRepository.save(done);
-                });
-            });
+            closeWithVoid(row, error, "The order was no longer payable; the capture was voided", true);
             return;
         }
-        boolean retryable = e.isTransient();
-        log.warn("Could not deliver payment result {} for order {} ({}): {}", row.getRequestId(), row.getOrderId(),
-                retryable ? "will retry" : "giving up", error);
+        if (!e.isTransient()) {
+            // A final rejection (e.g. 404, 422): the backend will never book this result, so a
+            // captured payment must not keep the customer's money. The row stays given up (and
+            // counted) so the rejection remains visible to operators.
+            log.error("Backend finally rejected payment result {} for order {}: {}; giving up and voiding a capture",
+                    row.getRequestId(), row.getOrderId(), error);
+            closeWithVoid(row, error, voidMessage(error), false);
+            metrics.givenUp();
+            return;
+        }
+        log.warn("Could not deliver payment result {} for order {} (will retry): {}", row.getRequestId(),
+                row.getOrderId(), error);
         AtomicBoolean givenUp = new AtomicBoolean();
         update(row.getId(), failed -> {
-            int attempts = retryable ? failed.getAttempts() + 1 : MAX_ATTEMPTS;
+            int attempts = failed.getAttempts() + 1;
             failed.setAttempts(attempts);
             failed.setLastError(error);
             failed.setNextAttemptAt(LocalDateTime.now(paymentClock).plus(backoff(attempts)));
             givenUp.set(attempts >= MAX_ATTEMPTS);
         });
         if (givenUp.get()) {
+            log.error("Giving up payment result {} for order {} after {} attempts: {}", row.getRequestId(),
+                    row.getOrderId(), MAX_ATTEMPTS, error);
             metrics.givenUp();
         }
+    }
+
+    /**
+     * Voids the payment's capture (when it is still voidable) and closes the row in one transaction:
+     * {@code delivered} marks it handled (409), otherwise it is marked given up.
+     */
+    private void closeWithVoid(PaymentOutboxEntity row, String error, String failureMessage, boolean delivered) {
+        transaction.executeWithoutResult(status -> {
+            LocalDateTime now = LocalDateTime.now(paymentClock);
+            paymentRepository.findById(row.getPaymentId()).ifPresent(payment -> {
+                if (PaymentStateMachine.voidCapture(payment, failureMessage, now)) {
+                    paymentRepository.save(payment);
+                }
+            });
+            outboxRepository.findById(row.getId()).ifPresent(done -> {
+                if (delivered) {
+                    done.setSentAt(now);
+                } else {
+                    done.setAttempts(MAX_ATTEMPTS);
+                    done.setNextAttemptAt(now.plus(MAX_BACKOFF));
+                }
+                done.setLastError(error);
+                outboxRepository.save(done);
+            });
+        });
+    }
+
+    /** The payment's failure message for a capture voided after a final rejection; fits the 255-character column. */
+    static String voidMessage(String error) {
+        String message = "The backend rejected the payment result (" + error + "); the capture was voided";
+        return message.length() <= FAILURE_MESSAGE_LENGTH ? message
+                : message.substring(0, FAILURE_MESSAGE_LENGTH - 3) + "...";
     }
 
     private void update(Long id, Consumer<PaymentOutboxEntity> change) {

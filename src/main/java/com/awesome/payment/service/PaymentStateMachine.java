@@ -67,13 +67,25 @@ public final class PaymentStateMachine {
      * @return false when the payment is not in a voidable state (nothing changed)
      */
     public static boolean voidCapture(PaymentEntity payment, LocalDateTime now) {
+        return voidCapture(payment, "The order was no longer payable; the capture was voided", now);
+    }
+
+    /**
+     * The backend finally rejected a capture (a non-retryable 4xx): the order never received the
+     * money, so it goes back to the card like {@link #voidCapture(PaymentEntity, LocalDateTime)}.
+     * The failure code stays {@link #ORDER_NOT_PAYABLE}, the only one the contract defines for a
+     * voided payment; {@code failureMessage} says why.
+     *
+     * @return false when the payment is not in a voidable state (nothing changed)
+     */
+    public static boolean voidCapture(PaymentEntity payment, String failureMessage, LocalDateTime now) {
         if (!VOIDABLE.contains(payment.getStatus())) {
             return false;
         }
         payment.setStatus(PaymentStatus.VOIDED);
         payment.setRefundedAmount(payment.getAmount());
         payment.setFailureCode(ORDER_NOT_PAYABLE);
-        payment.setFailureMessage("The order was no longer payable; the capture was voided");
+        payment.setFailureMessage(failureMessage);
         payment.setUpdatedAt(now);
         return true;
     }

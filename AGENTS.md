@@ -83,8 +83,7 @@ explicitly (`EventFeedPoller.poll()`).
   For each meaningful survivor add a test that passes on the original and fails
   on the mutant. Known equivalent mutants: the Luhn `digit > 9` boundary (a
   doubled digit is never 9), `sum +=` to `-=` (a multiple of 10 either way), the
-  backoff cap and error-truncation boundaries, the dispatcher's log-only
-  "will retry"/"giving up" ternary, the poller's REQUIRES_NEW propagation (there is
+  backoff cap and error-truncation boundaries, the poller's REQUIRES_NEW propagation (there is
   never an outer transaction) and cursor `>` boundary (re-saving the same value), and
   the refund reason truncation boundary (substring of the full length). Keep the run advisory; do not use the
   aggregate score as a gate.

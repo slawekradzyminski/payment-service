@@ -18,14 +18,15 @@ class BackendErrorMapperTest {
     }
 
     @ParameterizedTest
-    @ValueSource(ints = {400, 403, 404, 409, 422})
+    @ValueSource(ints = {400, 403, 404, 408, 409, 422, 429})
     void clientErrorsKeepStatusAndMessage(int status) {
         CustomException e = BackendErrorMapper.fromResponse(HttpStatusCode.valueOf(status), json("{\"message\":\"Nope\"}"));
 
         assertThat(e.getHttpStatus().value()).isEqualTo(status);
         assertThat(e.getMessage()).isEqualTo("Nope");
         assertThat(((BackendException) e).getBackendStatus()).isEqualTo(status);
-        assertThat(((BackendException) e).isTransient()).isFalse();
+        // A forbidden, timed-out or rate-limited call may succeed later; the others never will.
+        assertThat(((BackendException) e).isTransient()).isEqualTo(status == 403 || status == 408 || status == 429);
     }
 
     @ParameterizedTest
@@ -36,7 +37,7 @@ class BackendErrorMapperTest {
         assertThat(e.getHttpStatus()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         assertThat(e.getMessage()).isEqualTo("Backend unavailable");
         assertThat(((BackendException) e).getBackendStatus()).isEqualTo(status);
-        assertThat(((BackendException) e).isTransient()).isEqualTo(status >= 500);
+        assertThat(((BackendException) e).isTransient()).isTrue();
     }
 
     @Test
@@ -56,6 +57,7 @@ class BackendErrorMapperTest {
 
         assertThat(e.getHttpStatus()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(e.getMessage()).isEqualTo("odd");
+        assertThat(((BackendException) e).isTransient()).isFalse();
     }
 
     @Test
