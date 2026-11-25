@@ -122,17 +122,21 @@ payment change, sent right after the commit (by the dispatcher's own worker thre
 so the committing request or job never waits for the backend while holding a
 database connection), and retried every 30 seconds with
 exponential backoff (30 s doubling to 30 min, at most 10 attempts) while the
-backend answers 5xx or is unreachable. A 409 ("Order is not payable", for example
+backend answers 5xx, 401 or 403 (a rejected signature or service token, for example while
+`PAYMENT_WEBHOOK_SECRET` or `PAYMENT_SERVICE_TOKEN` is being rotated), 408 or 429, or is
+unreachable. A 409 ("Order is not payable", for example
 the order was cancelled during 3-D Secure) to a capture voids the payment
 (`VOIDED`, `refundedAmount = amount`, `failureCode = ORDER_NOT_PAYABLE`). Any
-other rejection (401 signature, 422 amount mismatch) is final and logged.
+other rejection (for example 404 or 422 amount mismatch) is final: the row is given up
+and logged as an error, and a capture is voided the same way (the `failureMessage` names the
+backend's answer), so the customer is never charged for a result the backend refused.
 
 Outbox metrics (ADR 3 outbox convention, on `/actuator/prometheus`):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `payment.outbox.pending` (`payment_outbox_pending`) | gauge | rows not sent and not given up (`sent_at` null, `attempts` < 10), counted in the database on each scrape |
-| `payment.outbox.failed` (`payment_outbox_failed_total`) | counter | rows this instance gave up on: a final rejection, or the 10th failed attempt. A 409 that voids the capture is handled, not counted |
+| `payment.outbox.failed` (`payment_outbox_failed_total`) | counter | rows this instance gave up on: a final rejection (even when it voided the capture), or the 10th failed attempt. A 409 that voids the capture is handled, not counted |
 
 Authentication uses the backend's RS256 access tokens (roles in the `auth` claim),
 verified with the public keys from the backend's JWKS, cached by `kid` and refetched
@@ -152,10 +156,15 @@ books the refund, records the event id in `processed_events` and advances the cu
 - the same `requestId` in another event books nothing (idempotent per `requestId`);
 - an order without a captured card payment books nothing (logged);
 - an amount above what is still refundable books nothing (logged as a warning);
-- a malformed payload or any other non-transient failure is logged with the event id
-  and skipped (recorded as processed, cursor advances), so the feed is never blocked;
-- the backend being unavailable (or a transient database failure) stops the poll
-  without moving the cursor; the next poll retries.
+- a poison event (a malformed payload, data the database refuses as an integrity violation such
+  as a duplicate key, or a final backend 4xx rejection of what it refers to) is logged at ERROR
+  with the event id and skipped (recorded as processed, cursor advances), so one bad
+  event never blocks the feed;
+- every other failure stops the poll without moving the cursor and the next poll retries the
+  same event: the backend being unavailable (no response, 5xx, 401, 403, 408, 429), any other
+  database or transaction failure (a dropped or refused connection, a failed commit, a timeout) and
+  any unexpected error (logged as an error). A refund is never dropped because the database
+  was briefly unreachable.
 
 A refund leaves the payment `PARTIALLY_REFUNDED` or `REFUNDED`. payment-service has
 no inbound internal API any more (the 1.0.0 `POST /internal/v1/payments/refunds`

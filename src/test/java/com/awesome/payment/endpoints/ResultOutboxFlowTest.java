@@ -157,7 +157,7 @@ class ResultOutboxFlowTest extends AbstractFlowTest {
     }
 
     @Test
-    void otherRejectionsAreFinalAndLeaveThePaymentAlone() {
+    void finalRejectionOfCaptureVoidsIt() {
         backend.failNextResults(422);
         PaymentDto payment = paid(VISA);
 
@@ -165,18 +165,36 @@ class ResultOutboxFlowTest extends AbstractFlowTest {
         assertThat(row.getAttempts()).isEqualTo(10);
         assertThat(row.getSentAt()).isNull();
         assertThat(row.getLastError()).isEqualTo("422 Scripted rejection");
-        assertThat(paymentRepository.findById(payment.id()).orElseThrow().getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+        PaymentDto voided = getJson(PAYMENTS + "/" + payment.id(), clientToken).as(PaymentDto.class);
+        assertThat(voided.status()).isEqualTo(PaymentStatus.VOIDED);
+        assertThat(voided.refundedAmount()).isEqualByComparingTo(voided.amount());
+        assertThat(voided.failureCode()).isEqualTo("ORDER_NOT_PAYABLE");
         clock.advance(Duration.ofHours(2));
         assertThat(dispatcher.dispatchDue()).isZero();
+        assertThat(backend.order(payment.orderId()).status()).isEqualTo(OrderStatus.PENDING);
     }
 
     @Test
-    void aRejectedSignatureIsNotRetried() {
-        backend.failNextResults(401);
+    void unauthorizedBackendIsRetriedNotAbandoned() {
+        // A mismatched PAYMENT_WEBHOOK_SECRET / PAYMENT_SERVICE_TOKEN while a rotation is rolled out.
+        backend.failNextResults(401, 401);
         PaymentDto payment = paid(VISA);
 
-        assertThat(row(payment).getAttempts()).isEqualTo(10);
-        assertThat(row(payment).getLastError()).isEqualTo("401 Backend unavailable");
+        PaymentOutboxEntity row = row(payment);
+        assertThat(row.getAttempts()).isEqualTo(1).isLessThan(10);
+        assertThat(row.getLastError()).isEqualTo("401 Backend unavailable");
+        assertThat(row.getNextAttemptAt()).isEqualTo(now().plusSeconds(30)).isAfter(now());
+        assertThat(row.getSentAt()).isNull();
+
+        clock.advance(Duration.ofSeconds(30));
+        assertThat(dispatcher.dispatchDue()).isZero();
+        assertThat(row(payment).getAttempts()).isEqualTo(2);
+
+        clock.advance(Duration.ofSeconds(60));
+        assertThat(dispatcher.dispatchDue()).isEqualTo(1);
+        assertThat(row(payment).getSentAt()).isEqualTo(now());
+        assertThat(paymentRepository.findById(payment.id()).orElseThrow().getStatus()).isEqualTo(PaymentStatus.CAPTURED);
+        assertThat(backend.order(payment.orderId()).status()).isEqualTo(OrderStatus.PAID);
     }
 
     @Test
