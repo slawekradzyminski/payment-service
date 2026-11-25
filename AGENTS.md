@@ -22,8 +22,10 @@ documentation, code comments, test names, commit messages and handoff notes.
   together with the contract and the backend.
 - Event feed handling: one local transaction per event (handle, record in
   `processed_events`, advance `event_cursors`); handlers implement `FeedEventHandler`,
-  must be idempotent and must not throw for expected business outcomes (that would
-  skip the event). Transient failures leave the cursor; others skip the event.
+  must be idempotent and must not throw for expected business outcomes. Only poison events
+  (`EventFeedPoller.isPoisonEvent`: `IllegalArgumentException`, `JacksonException`, a final
+  backend 4xx) are skipped; every database, transaction, transient backend or unexpected
+  failure leaves the cursor for the next poll.
 - Reads of another user's payment or order payments answer 404 like a missing one.
 - Backend 4xx keep status and message; unavailability is 503 "Backend unavailable".
 - Correlation ids (contract section "Correlation IDs"): `CorrelationFilter` runs first (right after
@@ -83,7 +85,7 @@ explicitly (`EventFeedPoller.poll()`).
   For each meaningful survivor add a test that passes on the original and fails
   on the mutant. Known equivalent mutants: the Luhn `digit > 9` boundary (a
   doubled digit is never 9), `sum +=` to `-=` (a multiple of 10 either way), the
-  backoff cap and error-truncation boundaries, the poller's REQUIRES_NEW propagation (there is
+  backoff cap and error-truncation boundaries, the poller's log-only retry-reason branches in `handle`, the poller's REQUIRES_NEW propagation (there is
   never an outer transaction) and cursor `>` boundary (re-saving the same value), and
   the refund reason truncation boundary (substring of the full length). Keep the run advisory; do not use the
   aggregate score as a gate.

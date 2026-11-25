@@ -12,12 +12,26 @@ import com.awesome.payment.repository.ProcessedEventRepository;
 import com.awesome.payment.tracing.Spans;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import jakarta.persistence.PersistenceException;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.orm.jpa.JpaSystemException;
+import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionSystemException;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.json.JsonMapper;
 import org.springframework.dao.QueryTimeoutException;
 import org.springframework.http.HttpStatus;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.AbstractPlatformTransactionManager;
 import org.springframework.transaction.support.DefaultTransactionStatus;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -26,19 +40,22 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-/** Failure handling the flow tests cannot provoke: transient database errors, backend 4xx, unknown types. */
+/** Failure handling the flow tests cannot provoke: database and transaction failures, poison events, backend 4xx, unknown types. */
 class EventFeedPollerTest {
 
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-11-10T12:00:00Z"), ZoneOffset.UTC);
@@ -75,6 +92,124 @@ class EventFeedPollerTest {
         assertThat(cursor.getLastSequence()).isZero();
         assertThat(processedIds).isEmpty();
         verify(handler, never()).handle(second);
+    }
+
+    @Test
+    void droppedConnectionKeepsCursor() {
+        FeedEvent refund = event(1, "card-refund.requested");
+        FeedEvent next = event(2, "card-refund.requested");
+        feed(new EventFeedPage(List.of(refund, next), 2, false));
+        doThrow(new DataAccessResourceFailureException("Connection refused")).when(handler).handle(refund);
+        EventFeedPoller poller = poller(true);
+
+        assertThat(poller.poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
+        assertThat(processedIds).isEmpty();
+        verify(processed, never()).save(any());
+        verify(handler, never()).handle(next);
+
+        // The connection is back: the same event is handled on the next poll.
+        doNothing().when(handler).handle(refund);
+        assertThat(poller.poll()).isEqualTo(2);
+        assertThat(processedIds).containsExactly(refund.id(), next.id());
+        assertThat(cursor.getLastSequence()).isEqualTo(2);
+    }
+
+    static Stream<RuntimeException> infrastructureFailures() {
+        return Stream.of(
+                new DataAccessResourceFailureException("Connection refused"),
+                new CannotGetJdbcConnectionException("pool exhausted", new SQLException("timeout")),
+                new CannotCreateTransactionException("Could not open JPA EntityManager"),
+                new JpaSystemException(new RuntimeException("connection closed")),
+                new TransactionSystemException("Could not commit JPA transaction"),
+                new DataIntegrityViolationException("duplicate key"),
+                new PersistenceException("connection reset"),
+                new IllegalStateException("wrapped", new SQLException("I/O error")),
+                new IllegalArgumentException("wrapped", new DataAccessResourceFailureException("gone")),
+                new IllegalStateException("not caused by the event"),
+                new NullPointerException());
+    }
+
+    @ParameterizedTest
+    @MethodSource("infrastructureFailures")
+    void anyFailureNotCausedByTheEventKeepsTheCursor(RuntimeException failure) {
+        FeedEvent refund = event(1, "card-refund.requested");
+        feed(new EventFeedPage(List.of(refund), 1, false));
+        doThrow(failure).when(handler).handle(refund);
+
+        assertThat(poller(true).poll()).isZero();
+
+        assertThat(cursor.getLastSequence()).isZero();
+        assertThat(processedIds).isEmpty();
+        assertThat(EventFeedPoller.isPoisonEvent(failure)).isFalse();
+    }
+
+    @Test
+    void aConnectionLostAtCommitKeepsTheCursor() {
+        FeedEvent refund = event(1, "card-refund.requested");
+        feed(new EventFeedPage(List.of(refund), 1, false));
+        InlineTransactionManager transactions = new InlineTransactionManager();
+        transactions.failCommits = true;
+
+        assertThat(poller(transactions).poll()).isZero();
+
+        verify(handler).handle(refund);
+        // The cursor read and the failed event commit; no skip transaction recorded the event.
+        assertThat(transactions.commits).isEqualTo(2);
+    }
+
+    static Stream<RuntimeException> poisonEvents() {
+        return Stream.of(
+                new IllegalArgumentException("card-refund.requested event has no requestId"),
+                new NumberFormatException("For input string: \"x\""),
+                jsonFailure(),
+                new BackendException("Unprocessable", HttpStatus.UNPROCESSABLE_CONTENT, 422, null));
+    }
+
+    @ParameterizedTest
+    @MethodSource("poisonEvents")
+    void aPoisonEventIsStillSkipped(RuntimeException failure) {
+        FeedEvent poison = event(1, "card-refund.requested");
+        FeedEvent next = event(2, "card-refund.requested");
+        feed(new EventFeedPage(List.of(poison, next), 2, false));
+        doThrow(failure).when(handler).handle(poison);
+
+        assertThat(poller(true).poll()).isEqualTo(2);
+
+        assertThat(processedIds).containsExactly(poison.id(), next.id());
+        assertThat(cursor.getLastSequence()).isEqualTo(2);
+        assertThat(EventFeedPoller.isPoisonEvent(failure)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 401, 403, 408, 429, 500, 503})
+    void aRetryableBackendFailureIsNotPoison(int status) {
+        BackendException failure = status == 0 ? BackendErrorMapper.unavailable(null)
+                : BackendErrorMapper.fromResponse(HttpStatusCode.valueOf(status), null);
+
+        assertThat(EventFeedPoller.isPoisonEvent(failure)).isFalse();
+    }
+
+    @Test
+    void aBrokerDeliveryHittingADroppedConnectionIsRolledBackForRedelivery() {
+        FeedEvent refund = event(1, "card-refund.requested");
+        doThrow(new DataAccessResourceFailureException("Connection refused")).when(handler).handle(refund);
+        EventFeedPoller poller = poller(true);
+
+        assertThatThrownBy(() -> poller.processDelivered(refund)).isInstanceOf(DataAccessResourceFailureException.class);
+
+        assertThat(processedIds).isEmpty();
+        assertThat(cursor.getLastSequence()).isZero();
+    }
+
+    private static RuntimeException jsonFailure() {
+        try {
+            JsonMapper.builder().build().readTree("{not json");
+        } catch (JacksonException e) {
+            return e;
+        }
+        throw new AssertionError("expected a parse failure");
     }
 
     @Test
@@ -239,9 +374,17 @@ class EventFeedPollerTest {
                 Spans.disabled(), enabled, "feed");
     }
 
+    private EventFeedPoller poller(InlineTransactionManager transactions) {
+        return new EventFeedPoller(backend, cursors, processed, List.of(handler), transactions, CLOCK,
+                Spans.disabled(), true, "feed");
+    }
+
     static class InlineTransactionManager extends AbstractPlatformTransactionManager {
 
         private static final long serialVersionUID = 1L;
+        /** Every commit after the first (the cursor read) fails like a connection lost while committing. */
+        boolean failCommits;
+        int commits;
 
         @Override
         protected Object doGetTransaction() {
@@ -255,7 +398,9 @@ class EventFeedPollerTest {
 
         @Override
         protected void doCommit(DefaultTransactionStatus status) {
-            // nothing to commit
+            if (failCommits && commits++ > 0) {
+                throw new TransactionSystemException("Could not commit JPA transaction: connection reset");
+            }
         }
 
         @Override

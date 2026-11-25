@@ -13,13 +13,17 @@ import com.awesome.payment.tracing.Spans;
 import io.micrometer.tracing.Span;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.dao.TransientDataAccessException;
+import jakarta.persistence.PersistenceException;
+import org.springframework.dao.DataAccessException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import tools.jackson.core.JacksonException;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -31,10 +35,11 @@ import java.util.stream.Collectors;
  * Pulls the backend's domain event feed ({@code GET /internal/v1/events}) from the stored cursor,
  * asking only for the types a {@link FeedEventHandler} consumes. Each event is handled in its own
  * transaction that also records it in {@code processed_events} and advances the cursor, so a crash
- * never loses or repeats an event. An event id seen before is skipped. The backend being
- * unavailable (or a transient database failure) stops the poll without moving the cursor; the next
- * tick retries. Any other handler failure is logged with the event id and the event is skipped,
- * so one bad event never blocks the feed. Scheduled every {@code payment.events.poll-interval},
+ * never loses or repeats an event. An event id seen before is skipped. Only an event whose content
+ * makes it fail ({@link #isPoisonEvent}: a malformed payload, or a final backend rejection) is logged
+ * with its id and skipped, so one bad event never blocks the feed. Every other failure (the backend
+ * unavailable, any database or transaction failure such as a dropped connection, or an unexpected
+ * error) stops the poll without moving the cursor; the next tick retries, so no refund is lost. Scheduled every {@code payment.events.poll-interval},
  * switched off with {@code payment.events.enabled}. While an event is handled, the MDC holds the
  * event's {@code requestId} and {@code traceId} (when valid), so the card refund of a cancellation
  * logs, and is stored, with the trace of the backend request that cancelled the order. With
@@ -169,7 +174,7 @@ public class EventFeedPoller {
         }
     }
 
-    /** Handles one event; false when it must be retried later (transient failure). */
+    /** Handles one event; false when it must be retried later (any failure but a poison event). */
     private boolean process(FeedEvent event) {
         String traceId = Correlation.validTraceId(event.traceId());
         try (Spans.Scope span = spans.child("process " + event.type(), Span.Kind.CONSUMER,
@@ -198,22 +203,55 @@ public class EventFeedPoller {
                 advance(cursor, event.sequence());
             });
             return true;
-        } catch (TransientDataAccessException e) {
-            log.warn("Event {} (sequence {}) hit a transient database failure; retrying on the next poll: {}",
-                    event.id(), event.sequence(), e.getMessage());
-            return false;
-        } catch (BackendException e) {
-            if (e.isTransient()) {
+        } catch (RuntimeException e) {
+            if (isPoisonEvent(e)) {
+                skip(event, e, span);
+                return true;
+            }
+            if (e instanceof BackendException backend && backend.isTransient()) {
                 log.warn("Event {} (sequence {}) needs the backend, which is unavailable; retrying on the next poll",
                         event.id(), event.sequence());
-                return false;
+            } else if (isInfrastructureFailure(e)) {
+                log.warn("Event {} (sequence {}) hit a database failure; retrying on the next poll: {}",
+                        event.id(), event.sequence(), e.getMessage());
+            } else {
+                span.error(e);
+                log.error("Event {} (sequence {}, type {}) failed unexpectedly; the cursor stays and the next poll "
+                        + "retries it", event.id(), event.sequence(), event.type(), e);
             }
-            skip(event, e, span);
-            return true;
-        } catch (RuntimeException e) {
-            skip(event, e, span);
-            return true;
+            return false;
         }
+    }
+
+    /**
+     * A failure caused by the event's content, which no retry can fix: a malformed payload
+     * ({@link IllegalArgumentException}, including number and UUID parse errors), unreadable JSON
+     * ({@link JacksonException}) or a final backend rejection of what the event refers to. A database
+     * or transaction failure anywhere in the cause chain is never poison, whatever wraps it.
+     */
+    static boolean isPoisonEvent(RuntimeException e) {
+        if (isInfrastructureFailure(e)) {
+            return false;
+        }
+        if (e instanceof BackendException backend) {
+            return !backend.isTransient();
+        }
+        return e instanceof IllegalArgumentException || e instanceof JacksonException;
+    }
+
+    /**
+     * A lost or refused database connection, a failed commit or any other data-access or transaction
+     * infrastructure error ({@link DataAccessException}, {@link TransactionException},
+     * {@link PersistenceException}, {@link SQLException}) anywhere in the cause chain.
+     */
+    static boolean isInfrastructureFailure(Throwable e) {
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof DataAccessException || cause instanceof TransactionException
+                    || cause instanceof PersistenceException || cause instanceof SQLException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Records a failed event as processed and moves past it; the failure is only logged. */
